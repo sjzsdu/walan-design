@@ -1,0 +1,159 @@
+# ========================================
+# 瓦栏 AI 花型设计自动售卖 - 全局配置
+# ========================================
+# 修改此文件即可调整所有参数，无需改代码
+# 所有默认值已对齐瓦栏《花型设计作品上传标准》PDF 原文
+
+# --- 瓦栏账号 ---
+walan:
+  base_url: "https://www.walanwalan.com"
+  upload_url: "https://www.walanwalan.com/console/designs/all/page1/?upload=1"
+  browser: "ego-lite"
+  auto_publish_zone: "public"
+  sell_type: "buyout_download"
+  price_tier: "tier_299"
+  custom_price:
+    buyout: 299
+    download: 99
+    psd: 50
+  tag_min: 3
+  tag_max: 5
+  existing_tags:
+    - 几何
+    - 动物
+    - 抽象
+    - 植物
+    - 花卉
+    - 田园
+    - 蝴蝶
+    - 豹纹
+    - 卡通
+    - 传统花卉
+
+# --- 趋势采集 ---
+trend:
+  sources:
+    - name: "pinterest"
+      enabled: true
+      keywords: "pattern design 2024, fabric pattern trend, floral pattern, geometric pattern"
+      max_items: 30
+    - name: "behance"
+      enabled: true
+      keywords: "surface pattern design, textile pattern"
+      max_items: 20
+    - name: "patternbank"
+      enabled: true
+      keywords: "trending patterns"
+      max_items: 20
+  llm:
+    provider: "openrouter"
+    model: "openrouter/auto"   # 自动选最便宜可用模型，或指定 "anthropic/claude-3.5-sonnet" / "openai/gpt-4o-mini"
+    base_url: "https://openrouter.ai/api/v1"
+    api_key: ""   # 留空则从环境变量 OPENROUTER_API_KEY 读取
+  brief_count: 5
+  output_dir: "output/trends"
+
+# --- AI 花型设计 ---
+design:
+  # 供应商选择：stability / dalle / stable_diffusion
+  # stability: 云端 SDXL API（推荐，质量高，~$0.03/张）
+  # dalle: OpenAI DALL-E 3（接入简单，~$0.04-0.12/张）
+  # stable_diffusion: 本地 SD WebUI（免费但需 GPU）
+  engine: "stability"
+  output_dir: "output/designs"
+
+  # 各供应商配置
+  stability:
+    api_key: ""  # 留空则从环境变量 STABILITY_API_KEY 读取
+    model: "SDXL-1.0"
+
+  dalle:
+    api_key: ""  # 留空则从环境变量 OPENAI_API_KEY 读取
+    model: "dall-e-3"
+
+  stable_diffusion:
+    api_url: "http://127.0.0.1:7860"
+    checkpoint: "v1-5-pruned-emaonly.safetensors"
+    use_controlnet: true
+    controlnet_model: "control_v11p_sd15_tile"
+    width: 1024
+    height: 1536   # 2:3 比例
+    steps: 30
+    cfg_scale: 7.5
+    batch_size: 1
+    negative_prompt: "text, watermark, logo, brand name, low quality, blurry, jpeg artifacts, deformed"
+
+  # 统一生图参数（所有供应商共用）
+  common:
+    # 生成比例（2:3 = 瓦栏标准 40cm×60cm）
+    aspect_ratio: "2:3"
+    # 每个设计生成几张候选
+    batch_size: 1
+    # 通用负画提示词
+    negative_prompt: "text, watermark, logo, brand name, low quality, blurry, deformed"
+    # 是否在 prompt 中强调无缝平铺
+    emphasize_tiling: true
+
+  # 一花四色（瓦栏强制标准：2深底+2浅底）
+  color_variant_count: 4
+  color_variant_mix: 2
+  output_dir: "output/designs"
+
+  # 设计风格偏好（影响 prompt 生成和 LLM 分析）
+  style_preferences:
+    target_market: "fabric_textile"
+    preferred_styles:
+      - "floral botanical"
+      - "geometric modern"
+      - "abstract organic"
+      - "animal print"
+      - "tropical"
+    color_schemes:
+      - "warm earth tones"
+      - "soft pastels"
+      - "vibrant tropical"
+      - "monochrome elegant"
+
+# --- 超分辨率放大 ---
+upscaler:
+  # 放大方法：auto / esrgan / lanczos
+  # auto: 先试 Real-ESRGAN，失败回退 LANCZOS
+  # esrgan: 只用 Real-ESRGAN（需安装，质量最好）
+  # lanczos: 只用 PIL LANCZOS（快速但质量一般）
+  method: "lanczos"
+  # 目标 DPI（放大到该 DPI 对应的像素尺寸）
+  target_dpi: 300
+  # 瓦栏尺寸 40cm×60cm @300DPI = 4724×7087 px
+
+# --- PSD 文件处理 ---
+psd:
+  dpi: 300
+  color_mode: "RGB"
+  layer_strategy: "background_main"
+  auto_seamless: true
+  seamless_tolerance: 0
+  output_dir: "output/psd"
+
+# --- 质量检测 ---
+quality:
+  enabled: true
+  checks:
+    resolution: true
+    seamless: true
+    originality: true
+    no_text: true
+    color_mode: true
+    color_variants: true
+    tag_count: true
+    dimensions: true
+  originality_threshold: 0.85
+  on_fail: "skip"
+  max_retries: 3
+
+# --- 流水线控制 ---
+pipeline:
+  batch_count: 5
+  manual_review: false
+  mode: "full"
+  log_level: "INFO"
+  temp_dir: "output/temp"

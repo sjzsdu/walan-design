@@ -1,0 +1,24 @@
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# === 虚拟环境 ===
+.venv/
+venv/
+
+# === 项目输出 ===
+output/
+
+# === IDE ===
+.idea/
+.vscode/
+.DS_Store
+
+# === 敏感文件 ===
+.env
+.env.local
+*.pem
