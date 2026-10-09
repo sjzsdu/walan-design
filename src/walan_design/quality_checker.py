@@ -39,7 +39,8 @@ def check_resolution(img_path: str, min_dpi: int = 200) -> tuple[bool, str]:
                 return False, "PSD 中无 ResolutionInfo 块"
         else:
             img = Image.open(img_path)
-            dpi = img.info.get("dpi", (0, 0))[0]
+            # PNG 的 DPI 回读常是 299.9994 这类浮点值，先取整再比较，避免 >=300 误挂
+            dpi = round(img.info.get("dpi", (0, 0))[0])
 
         if dpi >= min_dpi:
             return True, f"DPI={dpi}"
@@ -175,6 +176,10 @@ def quality_check_image(img_path: str, config: dict) -> dict:
         results["no_text"] = check_no_text(img_path)
     if checks_cfg.get("dimensions", True):
         results["dimensions"] = check_dimensions(img_path)
+    if checks_cfg.get("originality", True):
+        # 显式 no-op：原创性检测尚未实现（originality_threshold 未接线）。
+        # 这里明示跳过而不是静默不跑，避免「8 项全过」的假象。
+        results["originality"] = (True, "未实现，显式跳过（originality_threshold 未接线）")
 
     return results
 

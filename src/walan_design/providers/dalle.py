@@ -41,6 +41,7 @@ class DalleProvider(ImageProvider):
         base_url = config.get("dalle", {}).get("base_url", None)
         self.client = OpenAI(api_key=api_key, base_url=base_url) if api_key else None
         self.model = config.get("dalle", {}).get("model", "dall-e-3")
+        logger.info(f"DALL-E provider: model={self.model}, base_url={base_url or 'https://api.openai.com/v1'}")
 
     def health_check(self) -> bool:
         if self.client is None:

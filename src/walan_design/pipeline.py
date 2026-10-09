@@ -137,8 +137,9 @@ def run_pipeline(config: dict, mode: str = "full") -> dict:
             return output
 
         run_psd(design_results, config)
-        run_check(design_results, config)
-        upload_info = run_upload(design_results, config)
+        # 质量门必须真正过滤：只把通过检测的设计交给上传步骤
+        passed_results = run_check(design_results, config)
+        upload_info = run_upload(passed_results, config)
         output["upload_info"] = upload_info
 
     elapsed = time.time() - start

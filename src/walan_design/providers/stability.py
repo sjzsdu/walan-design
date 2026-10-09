@@ -57,6 +57,15 @@ def _select_2_3_resolution() -> tuple[int, int]:
     return best or (832, 1216)
 
 
+# config 里的模型名归一化：分支判定只认 core / ultra / sdxl-v1
+MODEL_ALIASES = {
+    "sdxl-1.0": "sdxl-v1",
+    "sdxl_v1": "sdxl-v1",
+    "sd-xl-1.0": "sdxl-v1",
+    "xl-1.0": "sdxl-v1",
+}
+
+
 class StabilityProvider(ImageProvider):
     """Stability AI 云端 API（v2beta）"""
 
@@ -71,7 +80,17 @@ class StabilityProvider(ImageProvider):
         super().__init__(config)
         self.api_key = config.get("stability", {}).get("api_key", "") or os.environ.get("STABILITY_API_KEY", "")
         # 默认用 Core（性价比最高），可设 ultra / core / sdxl-v1
-        self.model = config.get("stability", {}).get("model", "core")
+        raw_model = (config.get("stability", {}).get("model", "core") or "core").strip().lower()
+        self.model = MODEL_ALIASES.get(raw_model, raw_model)
+        logger.info(f"Stability provider: model={self.model}, endpoint={self._endpoint_for(self.model)}")
+
+    def _endpoint_for(self, model: str) -> str:
+        """根据归一化后的模型名返回生成 endpoint"""
+        if model == "sdxl-v1":
+            return f"{self.API_BASE}/stable-diffusion-xl-1024-v1-0/text-to-image"
+        if model == "ultra":
+            return f"{self.API_BASE}/stable-image/generate/ultra"
+        return f"{self.API_BASE}/stable-image/generate/core"
 
     def health_check(self) -> bool:
         """简化版：有 key 就认为可用，真正连通性在 generate 时验证"""
@@ -112,8 +131,8 @@ class StabilityProvider(ImageProvider):
             prompt_text += ", seamless tileable repeating pattern, edge-to-edge continuous"
 
         # 根据模型选 API endpoint 和参数
+        endpoint = self._endpoint_for(self.model)
         if self.model == "sdxl-v1":
-            endpoint = f"{self.API_BASE}/stable-diffusion-xl-1024-v1-0/text-to-image"
             # SDXL 用固定分辨率列表，选最接近 2:3 的
             w, h = _select_2_3_resolution()
             form_data = {
@@ -127,7 +146,6 @@ class StabilityProvider(ImageProvider):
                 "style_preset": "tile-texture",  # 专门针对无缝图案！
             }
         elif self.model == "ultra":
-            endpoint = f"{self.API_BASE}/stable-image/generate/ultra"
             form_data = {
                 "prompt": prompt_text,
                 "negative_prompt": params.negative_prompt,
@@ -135,7 +153,6 @@ class StabilityProvider(ImageProvider):
                 "output_format": "png",
             }
         else:  # core
-            endpoint = f"{self.API_BASE}/stable-image/generate/core"
             form_data = {
                 "prompt": prompt_text,
                 "negative_prompt": params.negative_prompt,
