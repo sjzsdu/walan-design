@@ -39,6 +39,7 @@ class SDWebUIProvider(ImageProvider):
         self.checkpoint = config.get("stable_diffusion", {}).get("checkpoint", "")
         self.use_controlnet = config.get("stable_diffusion", {}).get("use_controlnet", True)
         self.controlnet_model = config.get("stable_diffusion", {}).get("controlnet_model", "control_v11p_sd15_tile")
+        logger.info(f"SD WebUI provider: api_url={self.api_url}, checkpoint={self.checkpoint or '<server default>'}")
 
     def health_check(self) -> bool:
         try:

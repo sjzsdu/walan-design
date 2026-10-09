@@ -97,13 +97,15 @@ def make_seamless(img: Image.Image) -> Image.Image:
     left = arr[:, :blend, :]
     right_flipped = arr[:, w - blend :, :][:, ::-1, :]
     for x in range(blend):
-        alpha = x / blend
+        # alpha 随 x 从 1 → 0：左边缘被镜像右边缘完全替换（保证 col0 == col(w-1)），
+        # 越往内越保留原图；反方向会让接缝差异原样保留（见 quality check FAIL 复盘）
+        alpha = 1 - x / blend
         arr[:, x, :] = left[:, x, :] * (1 - alpha) + right_flipped[:, x, :] * alpha
 
     top = arr[:blend, :, :]
     bottom_flipped = arr[h - blend :, :, :][::-1, :, :]
     for y in range(blend):
-        alpha = y / blend
+        alpha = 1 - y / blend
         arr[y, :, :] = top[y, :, :] * (1 - alpha) + bottom_flipped[y, :, :] * alpha
 
     return Image.fromarray(arr.astype(np.uint8))
@@ -119,10 +121,10 @@ def run(briefs: list, config: dict = None) -> list:
     output_dir = Path(design_cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 初始化供应商
+    # 初始化供应商（传入 design 子树：各供应商的配置块都在 design.* 命名空间下）
     provider = None
     try:
-        provider = ImageProvider.create(engine, config)
+        provider = ImageProvider.create(engine, design_cfg)
         if provider.health_check():
             logger.info(f"✓ 供应商 {provider.name} 可用")
         else:
@@ -167,15 +169,7 @@ def run(briefs: list, config: dict = None) -> list:
             logger.warning("使用占位图")
             images = generate_placeholder(brief, config)
 
-        # 2. 接回位
-        if config["psd"].get("auto_seamless", True):
-            logger.info("  处理四方连续接回位...")
-            try:
-                images = [make_seamless(img) for img in images]
-            except Exception as e:
-                logger.warning(f"  接回位处理失败: {e}")
-
-        # 3. 超分辨率放大
+        # 2. 超分辨率放大
         logger.info(f"  超分辨率放大 (method={upscale_method}, target_dpi={target_dpi})...")
         upscaled = []
         for img in images:
@@ -186,6 +180,15 @@ def run(briefs: list, config: dict = None) -> list:
             except Exception as e:
                 logger.warning(f"  放大失败 ({e})，使用原图")
                 upscaled.append(img)
+
+        # 3. 接回位（必须在放大之后：LANCZOS 插值会重新引入边缘差异，
+        # 放大前融合的接缝到最终图上会退化，见 quality check seamless FAIL 复盘）
+        if config["psd"].get("auto_seamless", True):
+            logger.info("  处理四方连续接回位...")
+            try:
+                upscaled = [make_seamless(img) for img in upscaled]
+            except Exception as e:
+                logger.warning(f"  接回位处理失败: {e}")
 
         # 4. 一花四色
         color_count = design_cfg.get("color_variant_count", 4)

@@ -65,7 +65,7 @@ design:
   # 各供应商配置
   stability:
     api_key: ""  # 留空则从环境变量 STABILITY_API_KEY 读取
-    model: "SDXL-1.0"
+    model: "SDXL-1.0"  # 代码内归一化：SDXL-1.0 / sdxl-1.0 → sdxl-v1；也可直接写 sdxl-v1 / core / ultra
 
   dalle:
     api_key: ""  # 留空则从环境变量 OPENAI_API_KEY 读取
@@ -146,9 +146,9 @@ quality:
     color_variants: true
     tag_count: true
     dimensions: true
-  originality_threshold: 0.85
+  originality_threshold: 0.85  # 未接线：originality 检测未实现，检测时显式跳过（见 quality_checker.quality_check_image）
   on_fail: "skip"
-  max_retries: 3
+  max_retries: 3  # 未接线：retry 行为等同 skip（见 quality_checker.run 的 retry 分支）
 
 # --- 流水线控制 ---
 pipeline:
