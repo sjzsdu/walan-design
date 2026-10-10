@@ -33,16 +33,24 @@ walan:
 # --- 趋势采集 ---
 trend:
   sources:
-    - name: "pinterest"
+    # browser = ego-browser 真实浏览器采集（国内实测可用）
+    # walan      = 瓦栏公开区在售花型+价格（最强趋势信号，推荐）
+    # popfashion = POP服装趋势网趋势标题
+    # pinterest  = 国际趋势（国内网络被墙，保留兼容）
+    - name: "browser"
       enabled: true
+      keywords: "walan,popfashion"
+      max_items: 60
+    - name: "pinterest"
+      enabled: false   # 直连+浏览器均被墙
       keywords: "pattern design 2024, fabric pattern trend, floral pattern, geometric pattern"
       max_items: 30
     - name: "behance"
-      enabled: true
+      enabled: false
       keywords: "surface pattern design, textile pattern"
       max_items: 20
     - name: "patternbank"
-      enabled: true
+      enabled: false
       keywords: "trending patterns"
       max_items: 20
   llm:
@@ -50,6 +58,18 @@ trend:
     model: "openrouter/auto"   # 自动选最便宜可用模型，或指定 "anthropic/claude-3.5-sonnet" / "openai/gpt-4o-mini"
     base_url: "https://openrouter.ai/api/v1"
     api_key: ""   # 留空则从环境变量 OPENROUTER_API_KEY 读取
+  # 视觉 LLM（分析真实趋势图 / 免费视觉模型；备选 "openrouter/free"）
+  vision:
+    model: "dots-studio/dots-3-note-preview:free"
+    max_images: 8    # 每次分析附给模型的真实趋势图数量
+  # ego-browser 采集参数
+  browser:
+    scrolls: 3              # 每个关键词页面滚动次数
+    scroll_wait_ms: 1500    # 滚动间隔等待
+    max_images_per_keyword: 40
+    timeout_s: 300
+    download_dir: "output/trends/images"
+    max_download: 12        # 下载多少张供视觉分析
   brief_count: 5
   output_dir: "output/trends"
 
@@ -89,10 +109,41 @@ design:
     aspect_ratio: "2:3"
     # 每个设计生成几张候选
     batch_size: 1
-    # 通用负画提示词
+    # 通用负画提示词（prompt_engine 会自动追加专业补强项）
     negative_prompt: "text, watermark, logo, brand name, low quality, blurry, deformed"
     # 是否在 prompt 中强调无缝平铺
     emphasize_tiling: true
+
+  # --- Prompt 工程（纺织花型专业术语增强）---
+  prompt:
+    # 质量增强词：追加在主体描述之后
+    quality_boosters: "professional textile surface pattern design, print-ready artwork, high detail, crisp clean edges, rich color depth, award-winning surface design"
+    # 构图约束：保证四方连续的均衡排布
+    composition_constraints: "balanced all-over repeat layout, evenly distributed motifs, harmonious negative space, flat illustration style, no cropped motifs"
+    # 印刷媒介提示：去掉照片感/透视/阴影
+    medium_hints: "flat textile print for fabric industry, matte finish, no perspective, no shadows"
+    # 额外负向词（与 common.negative_prompt 合并去重）
+    negative_extra: "photorealistic photo, 3d render, human, face, hands, signature, frame, border, uneven edges, distorted motifs, cluttered, oversaturated, gradient noise"
+
+  # --- AI 视觉自评闭环（生图后打分，低分带建议重生成）---
+  visual_review:
+    enabled: true
+    model: "dots-studio/dots-3-note-preview:free"   # OpenRouter 免费视觉模型（实测最稳）；备选 "openrouter/free"
+    base_url: "https://openrouter.ai/api/v1"
+    api_key: ""        # 留空读 OPENROUTER_API_KEY
+    threshold: 70      # 低于该分触发重生成（0-100）
+    max_retries: 2     # 最多重生成次数
+
+  # --- 一花四色专业调色板 ---
+  recolor:
+    cluster_count: 8   # 主色聚类数
+    # palettes 留空则用内置方案（深底：墨蓝金/酒红夜曲/松林暮色；浅底：奶油乡村/雾霾粉彩/薄荷清晨）
+    # 自定义示例：
+    # palettes:
+    #   dark:
+    #     - {name: "午夜玫瑰", colors: ["#1A0B10", "#4A1B2F", "#8C3A52", "#D4A5A5", "#F2E8E8"]}
+    #   light:
+    #     - {name: "燕麦拿铁", colors: ["#F7F3ED", "#E8DFD3", "#C9B79C", "#9C8468", "#5E5245"]}
 
   # 一花四色（瓦栏强制标准：2深底+2浅底）
   color_variant_count: 4

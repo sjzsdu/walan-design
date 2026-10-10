@@ -153,24 +153,33 @@ def analyze_with_llm(trend_data: list, config: dict) -> list:
     llm_cfg = config["trend"]["llm"]
     brief_count = config["trend"]["brief_count"]
     style_prefs = config["design"]["style_preferences"]
-    trend_summary = json.dumps(trend_data[:50], ensure_ascii=False, indent=2)
+    trend_summary = json.dumps(
+        [{k: v for k, v in item.items() if k != "src"} for item in trend_data[:50]],
+        ensure_ascii=False,
+        indent=2,
+    )
 
-    system_prompt = f"""你是一位专业的花型设计师和趋势分析师。
-根据以下从国际时尚网站采集的趋势数据，生成 {brief_count} 个花型设计 Brief。
+    system_prompt = f"""你是一位有 15 年经验的纺织花型设计师兼趋势分析师，服务国际面料市场（女装、家纺、童装）。
+根据以下真实采集的趋势数据（含 Pinterest 流行花型的图片描述），生成 {brief_count} 个花型设计 Brief。
 
-设计要求：
+专业要求：
 - 目标市场：{style_prefs["target_market"]}
 - 偏好风格：{", ".join(style_prefs["preferred_styles"])}
 - 偏好配色：{", ".join(style_prefs["color_schemes"])}
-- 花型必须是原创的、容易被市场接受的流行风格
-- 花型需要能做成四方连续（无缝拼接）
+- 花型必须原创、贴合当下真实流行趋势（不要凭空想象过时款式）
+- 必须能做四方连续无缝拼接
+- sd_prompt 必须用纺织设计行业标准术语，具体描述：主体母题（motif）的形态与排布方式、
+  底色与主色（给出具体色彩名）、笔触/质感（如 hand-painted gouache, flat vector, watercolor wash）、
+  母题密度（如 dense allover, spaced tossed）、参考印花工艺（如 digital print style）。
+  禁止只写 "beautiful pattern" 这类空话。长度 40-70 词。
+- 描述里出现 nautical、 Retro 等具体风格词时优先吸收进 sd_prompt
 
 请返回 JSON 数组，每个元素包含：
 - title: 花型名称（中文，10字以内）
 - theme: 主题描述（中文，30字以内）
-- colors: 配色方案（英文逗号分隔的颜色描述）
+- colors: 配色方案（英文逗号分隔的具体颜色名，如 terracotta, sage green, cream）
 - style: 风格关键词（英文）
-- sd_prompt: Stable Diffusion 的英文 prompt（包含 seamless pattern, tileable 等关键词）
+- sd_prompt: Stable Diffusion 的英文 prompt（以 seamless pattern 开头）
 - tags: 适合的瓦栏标签（从这些中选择：几何、动物、抽象、植物、花卉、田园、蝴蝶、豹纹、卡通、传统花卉）
 """
 
@@ -188,26 +197,106 @@ def analyze_with_llm(trend_data: list, config: dict) -> list:
         logger.warning(f"未配置 {env_var}，使用本地规则生成 Brief")
         return _local_fallback_briefs(brief_count, style_prefs)
 
+    # 视觉分析：趋势数据里带真实下载图片时，直接给视觉模型看图
+    vision_cfg = config["trend"].get("vision", {})
+    image_items = [t for t in trend_data if t.get("image_path")][: int(vision_cfg.get("max_images", 8))]
+    model = llm_cfg.get("model", "gpt-4o")
+    user_content = f"趋势数据：\n{trend_summary}"
+    if image_items:
+        model = vision_cfg.get("model", model)
+        logger.info(f"  视觉模式：附加 {len(image_items)} 张真实趋势图（{model}）")
+
     try:
+        import base64
+
         from openai import OpenAI
 
         client_kwargs = {"api_key": api_key}
         if base_url:
             client_kwargs["base_url"] = base_url
         client = OpenAI(**client_kwargs)
-        response = client.chat.completions.create(
-            model=llm_cfg.get("model", "gpt-4o"),
-            messages=[
+
+        if image_items:
+            content_parts = [
+                {
+                    "type": "text",
+                    "text": "以下是当前 Pinterest 上真实流行的花型图片（附描述数据）。"
+                    "请逐张分析它们的母题、配色、风格趋势，再结合趋势数据生成 Brief：\n\n" + trend_summary,
+                }
+            ]
+            for t in image_items:
+                with open(t["image_path"], "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode()
+                content_parts.append(
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                )
+            messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"趋势数据：\n{trend_summary}"},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.8,
-        )
+                {"role": "user", "content": content_parts},
+            ]
+            # 部分免费视觉模型不支持 response_format，靠解析兜底
+            response = client.chat.completions.create(model=model, messages=messages, temperature=0.8)
+        else:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.8,
+            )
         content = response.choices[0].message.content
-        result = json.loads(content)
-        briefs = result.get("briefs") or result.get("designs") or ([result] if isinstance(result, dict) else result)
-        return briefs[:brief_count]
+
+        # 容错解析：模型可能返回 ```json 包裹或前后带说明文字
+        result = None
+        try:
+            result = json.loads(content)
+        except json.JSONDecodeError:
+            m = re.search(r"\[.*\]|\{.*\}", content, re.DOTALL)
+            if m:
+                result = json.loads(m.group(0))
+        if result is None:
+            raise ValueError(f"LLM 返回内容无法解析为 JSON: {content[:200]}")
+
+        # LLM 可能返回 {"briefs": [...]} / {"designs": [...]} / 裸数组 / 单个对象
+        if isinstance(result, dict):
+            briefs = result.get("briefs") or result.get("designs") or [result]
+        elif isinstance(result, list):
+            briefs = result
+        else:
+            briefs = [result]
+
+        # 规范化每个 brief：tags 可能是字符串（"植物、抽象"）或数组
+        valid_tags = set(config["walan"]["existing_tags"])
+        normalized = []
+        for b in briefs:
+            if not isinstance(b, dict):
+                continue
+            tags = b.get("tags", [])
+            if isinstance(tags, str):
+                # 按 、/,/空格 拆分
+                for sep in ["，", ",", " ", "、"]:
+                    tags = tags.replace(sep, "、")
+                tags = [t.strip() for t in tags.split("、") if t.strip()]
+            elif isinstance(tags, list):
+                tags = [str(t).strip() for t in tags if str(t).strip()]
+            else:
+                tags = []
+            # 过滤到瓦栏有效标签集合内；不足时从有效集合补齐
+            tags = [t for t in tags if t in valid_tags]
+            if len(tags) < 3:
+                for t in ["花卉", "植物", "几何", "抽象", "田园"]:
+                    if len(tags) >= 3:
+                        break
+                    if t not in tags:
+                        tags.append(t)
+            b["tags"] = tags[:5]
+            normalized.append(b)
+
+        if not normalized:
+            raise ValueError("LLM 未返回有效 brief")
+        return normalized[:brief_count]
     except Exception as e:
         logger.error(f"LLM 分析失败: {e}")
         return _local_fallback_briefs(brief_count, style_prefs)
@@ -228,17 +317,23 @@ def run(config: dict = None) -> list:
         max_items = source.get("max_items", 20)
         logger.info(f"从 {name} 采集趋势... 关键词: {keywords}")
 
-        collector = {
-            "pinterest": collect_pinterest,
-            "behance": collect_behance,
-            "patternbank": collect_patternbank,
-        }.get(name)
-        if collector:
-            data = collector(keywords, max_items)
+        if name == "browser":
+            # ego-browser 真实浏览器采集（国内可用，返回带本地图片的 items）
+            from walan_design.browser_trends import collect_via_browser
+
+            data = collect_via_browser(keywords, config)
+        else:
+            collector = {
+                "pinterest": collect_pinterest,
+                "behance": collect_behance,
+                "patternbank": collect_patternbank,
+            }.get(name)
+            data = collector(keywords, max_items) if collector else []
+            if collector is None:
+                logger.warning(f"未知来源: {name}")
+        if data:
             all_data.extend(data)
             logger.info(f"  {name} 采集到 {len(data)} 条")
-        else:
-            logger.warning(f"未知来源: {name}")
 
     logger.info(f"总共采集到 {len(all_data)} 条趋势数据")
     logger.info("使用 LLM 分析趋势，生成设计 Brief...")

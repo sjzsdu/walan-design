@@ -1,7 +1,7 @@
 """
 AI 花型设计模块
 多供应商架构：Stability API / DALL-E 3 / 本地 SD WebUI
-生成花型图片 → 接回位 → 超分辨率放大 → 一花四色
+生成花型图片 → AI 视觉自评（低分重生成）→ 超分辨率放大 → 接回位 → 一花四色（专业调色板）
 """
 
 import logging
@@ -46,48 +46,6 @@ def generate_placeholder(brief: dict, config: dict) -> list[Image.Image]:
     return images
 
 
-def _shift_hsv(arr: np.ndarray, hue_shift: float = 0.0, sat_scale: float = 1.0, val_scale: float = 1.0) -> np.ndarray:
-    """在 HSV 空间对图片做颜色变换"""
-    img = Image.fromarray(arr.astype(np.uint8))
-    hsv = np.array(img.convert("HSV"), dtype=np.float32)
-    hsv[..., 0] = (hsv[..., 0] / 255.0 + hue_shift) % 1.0 * 255
-    hsv[..., 1] = np.clip(hsv[..., 1] * sat_scale, 0, 255)
-    hsv[..., 2] = np.clip(hsv[..., 2] * val_scale, 0, 255)
-    rgb = Image.fromarray(hsv.astype(np.uint8), mode="HSV").convert("RGB")
-    return np.array(rgb)
-
-
-def generate_color_variants(base_img: Image.Image, count: int = 4, dark_count: int = 2) -> list[Image.Image]:
-    """
-    一花四色（PDF 强制标准：2深底 + 2浅底，色相有明显区别）。
-    用 HSV 变换在同一张图上生成不同配色，保持花型结构不变。
-    """
-    arr = np.array(base_img).astype(np.float32)
-    variants = []
-
-    dark_presets = [
-        {"hue": 0.05, "sat": 0.7, "val": 0.55},
-        {"hue": -0.08, "sat": 0.6, "val": 0.5},
-    ]
-    light_presets = [
-        {"hue": -0.02, "sat": 0.8, "val": 1.25},
-        {"hue": 0.08, "sat": 0.7, "val": 1.3},
-    ]
-
-    all_presets = dark_presets[:dark_count] + light_presets[: count - dark_count]
-
-    for preset in all_presets[:count]:
-        variant_arr = _shift_hsv(
-            arr,
-            hue_shift=preset["hue"],
-            sat_scale=preset["sat"],
-            val_scale=preset["val"],
-        )
-        variants.append(Image.fromarray(variant_arr.astype(np.uint8)))
-
-    return variants
-
-
 def make_seamless(img: Image.Image) -> Image.Image:
     """快速版四方连续：numpy 加速的边缘镜像融合"""
     arr = np.array(img).astype(np.float32)
@@ -111,6 +69,61 @@ def make_seamless(img: Image.Image) -> Image.Image:
     return Image.fromarray(arr.astype(np.uint8))
 
 
+def _generate_with_review(
+    provider,
+    brief: dict,
+    config: dict,
+    sd_cfg: dict,
+    common: dict,
+) -> tuple[list, list]:
+    """
+    生图 + 视觉自评闭环。
+    返回 (images, critiques)：critiques 记录每轮评分过程。
+    """
+    from walan_design.prompt_engine import build_negative_prompt, build_sd_prompt
+    from walan_design.visual_critic import critique_image
+
+    vcfg = config.get("design", {}).get("visual_review", {})
+    enabled = vcfg.get("enabled", False)
+    max_retries = int(vcfg.get("max_retries", 2)) if enabled else 0
+
+    base_prompt = build_sd_prompt(brief, config)
+    neg_prompt = build_negative_prompt(config)
+
+    images, critiques = [], []
+    prompt = base_prompt
+    for attempt in range(max_retries + 1):
+        params = GenerationParams(
+            prompt=prompt,
+            negative_prompt=neg_prompt,
+            width=sd_cfg.get("width", 1024),
+            height=sd_cfg.get("height", 1536),
+            batch_size=common.get("batch_size", 1),
+            steps=sd_cfg.get("steps", 30),
+            cfg_scale=sd_cfg.get("cfg_scale", 7.5),
+            tiling=common.get("emphasize_tiling", True),
+        )
+        result = provider.generate(params)
+        images = result.images
+        logger.info(f"  {provider.name} 直出: {len(images)} 张, {images[0].size if images else 'N/A'}")
+
+        if not enabled or not images:
+            break
+
+        critique = critique_image(images[0], brief, config)
+        critique["attempt"] = attempt + 1
+        critique["prompt"] = prompt
+        critiques.append(critique)
+
+        if critique["passed"]:
+            break
+        if attempt < max_retries and critique.get("suggestions"):
+            prompt = f"{base_prompt}, {critique['suggestions']}"
+            logger.info(f"  低于阈值，带改进建议重生成 (第 {attempt + 2} 次): {prompt[:100]}...")
+
+    return images, critiques
+
+
 def run(briefs: list, config: dict = None) -> list:
     if config is None:
         config = load_config()
@@ -120,6 +133,7 @@ def run(briefs: list, config: dict = None) -> list:
     common = design_cfg.get("common", {})
     output_dir = Path(design_cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    sd_cfg = design_cfg.get("stable_diffusion", {})
 
     # 初始化供应商（传入 design 子树：各供应商的配置块都在 design.* 命名空间下）
     provider = None
@@ -143,25 +157,11 @@ def run(briefs: list, config: dict = None) -> list:
         title = brief.get("title", f"design_{i + 1}")
         logger.info(f"\n=== 设计 {i + 1}/{len(briefs)}: {title} ===")
 
-        # 1. AI 生图
-        images = []
+        # 1. AI 生图 + 视觉自评闭环
+        images, critiques = [], []
         if provider is not None:
-            sd_cfg = design_cfg.get("stable_diffusion", {})
-            neg_prompt = common.get("negative_prompt", sd_cfg.get("negative_prompt", ""))
-            params = GenerationParams(
-                prompt=brief.get("sd_prompt", ""),
-                negative_prompt=neg_prompt,
-                width=design_cfg.get("stable_diffusion", {}).get("width", 1024),
-                height=design_cfg.get("stable_diffusion", {}).get("height", 1536),
-                batch_size=common.get("batch_size", 1),
-                steps=design_cfg.get("stable_diffusion", {}).get("steps", 30),
-                cfg_scale=design_cfg.get("stable_diffusion", {}).get("cfg_scale", 7.5),
-                tiling=common.get("emphasize_tiling", True),
-            )
             try:
-                result = provider.generate(params)
-                images = result.images
-                logger.info(f"  {provider.name} 直出: {len(images)} 张, {images[0].size if images else 'N/A'}")
+                images, critiques = _generate_with_review(provider, brief, config, sd_cfg, common)
             except Exception as e:
                 logger.error(f"  供应商生成失败: {e}")
 
@@ -190,13 +190,22 @@ def run(briefs: list, config: dict = None) -> list:
             except Exception as e:
                 logger.warning(f"  接回位处理失败: {e}")
 
-        # 4. 一花四色
+        # 4. 一花四色（专业调色板重着色）
+        from walan_design.recolor import generate_color_variants
+
         color_count = design_cfg.get("color_variant_count", 4)
         dark_count = design_cfg.get("color_variant_mix", 2)
+        palette_cfg = design_cfg.get("recolor", {}).get("palettes")
         base_image = upscaled[0] if upscaled else images[0]
         logger.info(f"  生成一花四色变体: {color_count} 个（{dark_count}深底 + {color_count - dark_count}浅底）")
         try:
-            color_variants = generate_color_variants(base_image, count=color_count, dark_count=dark_count)
+            color_variants = generate_color_variants(
+                base_image,
+                count=color_count,
+                dark_count=dark_count,
+                palette_cfg=palette_cfg,
+                cluster_count=int(design_cfg.get("recolor", {}).get("cluster_count", 8)),
+            )
             all_images = upscaled + color_variants
         except Exception as e:
             logger.warning(f"  配色变体生成失败: {e}")
@@ -218,6 +227,7 @@ def run(briefs: list, config: dict = None) -> list:
                 "base_image_count": len(upscaled),
                 "color_variant_count": len(all_images) - len(upscaled),
                 "provider": provider.name if provider else "placeholder",
+                "visual_review": critiques,  # 自评记录（含最终得分与建议）
             }
         )
 

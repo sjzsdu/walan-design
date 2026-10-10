@@ -80,6 +80,26 @@ def _make_psd_with_dpi(pil_img: Image.Image, psd_path: str, dpi: int, layer_stra
     res_data = struct.pack(">IHHIHH", fixed, 2, 1, fixed, 2, 1)
     resource_block = b"8BIM" + b"\x03\xed" + b"\x00\x00" + struct.pack(">I", len(res_data)) + res_data
 
+    # XMP 元数据（0x0424）— Photoshop 标准做法，PIL/exiftool 等解析器读 DPI 的另一条路径
+    xmp = (
+        '<?xpacket begin="\ufeff" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">\n'
+        ' <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
+        '  <rdf:Description rdf:about=""\n'
+        '    xmlns:tiff="http://ns.adobe.com/tiff/1.0/">\n'
+        f'   <tiff:XResolution>{dpi}/1</tiff:XResolution>\n'
+        f'   <tiff:YResolution>{dpi}/1</tiff:YResolution>\n'
+        '   <tiff:ResolutionUnit>2</tiff:ResolutionUnit>\n'
+        '  </rdf:Description>\n'
+        ' </rdf:RDF>\n'
+        '</x:xmpmeta>\n'
+        '<?xpacket end="w"?>'
+    ).encode("utf-8")
+    # PSD 规范: resource data 按 2 字节对齐，奇数长度补 1 字节 pad（pad 不计入长度字段）
+    resource_block += (
+        b"8BIM" + b"\x04\x24" + b"\x00\x00" + struct.pack(">I", len(xmp)) + xmp + (b"\x00" if len(xmp) % 2 else b"")
+    )
+
     new_ir = data[ir_start:ir_end] + resource_block
     patched = bytes(data[:ir_len_pos]) + struct.pack(">I", len(new_ir)) + bytes(new_ir) + bytes(data[ir_end:])
 

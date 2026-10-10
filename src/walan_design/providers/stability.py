@@ -131,21 +131,12 @@ class StabilityProvider(ImageProvider):
             prompt_text += ", seamless tileable repeating pattern, edge-to-edge continuous"
 
         # 根据模型选 API endpoint 和参数
-        endpoint = self._endpoint_for(self.model)
         if self.model == "sdxl-v1":
-            # SDXL 用固定分辨率列表，选最接近 2:3 的
-            w, h = _select_2_3_resolution()
-            form_data = {
-                "prompt": prompt_text,
-                "negative_prompt": params.negative_prompt,
-                "width": str(w),
-                "height": str(h),
-                "samples": str(params.batch_size),
-                "steps": str(params.steps),
-                "cfg_scale": str(params.cfg_scale),
-                "style_preset": "tile-texture",  # 专门针对无缝图案！
-            }
-        elif self.model == "ultra":
+            # SDXL 1.0 已从 v2beta 下线，改用 legacy v1 API（JSON + base64）
+            return self._generate_sdxl_v1(params, prompt_text)
+
+        endpoint = self._endpoint_for(self.model)
+        if self.model == "ultra":
             form_data = {
                 "prompt": prompt_text,
                 "negative_prompt": params.negative_prompt,
@@ -210,6 +201,62 @@ class StabilityProvider(ImageProvider):
                 metadata={"model": self.model},
             )
 
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError("Stability API 连接失败")
+
+    def _generate_sdxl_v1(self, params: GenerationParams, prompt_text: str) -> GenerationResult:
+        """SDXL 1.0 legacy v1 API：JSON 请求，base64 返回，支持 tile-texture 预设"""
+        import base64
+
+        endpoint = "https://api.stability.ai/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image"
+        w, h = _select_2_3_resolution()
+        payload = {
+            "text_prompts": [
+                {"text": prompt_text, "weight": 1.0},
+                {"text": params.negative_prompt, "weight": -1.0},
+            ],
+            "width": w,
+            "height": h,
+            "samples": params.batch_size,
+            "steps": params.steps,
+            "cfg_scale": params.cfg_scale,
+            "style_preset": "tile-texture",  # 专门针对无缝图案
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        logger.info(f"  Stability sdxl-v1 (v1 legacy): {prompt_text[:60]}... | {w}x{h}")
+
+        try:
+            resp = requests.post(endpoint, headers=headers, json=payload, timeout=180)
+            if resp.status_code != 200:
+                try:
+                    err = resp.json()
+                    msg = str(err.get("message", ""))[:200]
+                except Exception:
+                    msg = resp.text[:200]
+                raise RuntimeError(f"Stability API {resp.status_code}: {msg}")
+
+            data = resp.json()
+            images = []
+            for artifact in data.get("artifacts", []):
+                if artifact.get("base64"):
+                    img = Image.open(io.BytesIO(base64.b64decode(artifact["base64"])))
+                    images.append(img)
+
+            if not images:
+                raise RuntimeError("Stability v1 API 未返回有效图片")
+
+            logger.info(f"  Stability 成功: {len(images)} 张, 原始 {images[0].size}")
+            return GenerationResult(
+                images=images,
+                provider="stability-sdxl-v1",
+                raw_resolution=images[0].size,
+                metadata={"model": "sdxl-v1", "style_preset": "tile-texture"},
+            )
         except requests.exceptions.ConnectionError:
             raise RuntimeError("Stability API 连接失败")
 
