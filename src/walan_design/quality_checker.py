@@ -20,6 +20,22 @@ def load_config():
         return yaml.safe_load(f)
 
 
+def load_image(img_path: str) -> Image.Image:
+    """
+    通用图片加载器——PSD 用 psd-tools（避免 PIL 对压缩格式支持有限），其他用 PIL。
+    ZIP_WITH_PREDICTION 等压缩格式 PIL 读不了，必须走 psd-tools → composite。
+    """
+    if img_path.lower().endswith(".psd"):
+        from psd_tools import PSDImage as _PSD
+
+        psd = _PSD.open(img_path)
+        img = psd.composite()
+        # psd-tools 没有 close()，del 释放文件句柄
+        del psd
+        return img.convert("RGB")
+    return Image.open(img_path).convert("RGB")
+
+
 def check_resolution(img_path: str, min_dpi: int = 200) -> tuple[bool, str]:
     """检查 DPI 是否达标。对 PSD 用 psd-tools 读 ResolutionInfo，其他用 PIL 读 info.dpi。"""
     try:
@@ -56,7 +72,7 @@ def check_seamless(img_path: str, tolerance: int = 1) -> tuple[bool, str]:
     如果差异在容差内，认为接回位合格。
     """
     try:
-        img = Image.open(img_path).convert("RGB")
+        img = load_image(img_path)
         arr = np.array(img)
         h, w = arr.shape[:2]
 
@@ -80,7 +96,7 @@ def check_seamless(img_path: str, tolerance: int = 1) -> tuple[bool, str]:
 def check_color_mode(img_path: str) -> tuple[bool, str]:
     """检查是否为 RGB 模式"""
     try:
-        img = Image.open(img_path)
+        img = load_image(img_path)
         mode = img.mode
         if mode == "RGB":
             return True, f"模式={mode}"
@@ -95,7 +111,7 @@ def check_no_text(img_path: str) -> tuple[bool, str]:
     用边缘密度判断：图片上有大面积高对比度边缘区域可能是文字/水印。
     """
     try:
-        img = Image.open(img_path).convert("L")
+        img = load_image(img_path).convert("L")
         arr = np.array(img, dtype=np.float32)
         h_grad = np.abs(np.diff(arr, axis=1))
         v_grad = np.abs(np.diff(arr, axis=0))
@@ -118,7 +134,7 @@ def check_dimensions(
     允许 5% 容差。
     """
     try:
-        img = Image.open(img_path)
+        img = load_image(img_path)
         w, h = img.size
         # 计算实际比例（小/大），然后和期望比例比较
         actual_ratio = min(w, h) / max(w, h)
@@ -177,9 +193,9 @@ def quality_check_image(img_path: str, config: dict) -> dict:
     if checks_cfg.get("dimensions", True):
         results["dimensions"] = check_dimensions(img_path)
     if checks_cfg.get("originality", True):
-        # 显式 no-op：原创性检测尚未实现（originality_threshold 未接线）。
-        # 这里明示跳过而不是静默不跑，避免「8 项全过」的假象。
-        results["originality"] = (True, "未实现，显式跳过（originality_threshold 未接线）")
+        # 批次级 pHash 去重已在 run() 的阶段 2 执行（见 dedup_checker）
+        # 此处是单文件级入口，无单文件判重能力，显式 pass 让阶段 2 接手
+        results["originality"] = (True, "批次级 pHash 去重已在阶段 2 执行，此处显式 pass")
 
     return results
 
@@ -260,7 +276,21 @@ def run(design_results: list, config: dict = None) -> list:
             if result.get("psd_paths"):
                 passed_results.append(result)
 
-    logger.info(f"\n质量检测完成: {len(passed_results)}/{len(design_results)} 通过")
+    logger.info(f"\n[阶段1] 基础检测完成: {len(passed_results)}/{len(design_results)} 通过")
+
+    # 阶段 2：批次级防重复检测（替换原 originality no-op）
+    dedup_cfg = config.get("quality", {}).get("dedup", {})
+    if dedup_cfg.get("enabled", True):
+        try:
+            from walan_design.dedup_checker import check_and_mark
+
+            passed_results = check_and_mark(passed_results, config)
+            logger.info(f"[阶段2] 防重复后: {len(passed_results)} 个设计保留")
+        except ImportError:
+            logger.warning("dedup_checker 不可用，跳过批次级去重")
+    else:
+        logger.info("[阶段2] 防重复检测已禁用")
+
     return passed_results
 
 

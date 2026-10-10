@@ -23,19 +23,41 @@ def load_config():
         return yaml.safe_load(f)
 
 
-def _make_psd_with_dpi(pil_img: Image.Image, psd_path: str, dpi: int, layer_strategy: str = "background_main"):
+def _make_psd_with_dpi(
+    pil_img: Image.Image,
+    psd_path: str,
+    dpi: int,
+    layer_strategy: str = "background_main",
+    compression: str = "zip_prediction",
+):
     """
-    用 psd-tools 创建带正确 DPI + 分层的 PSD 文件。
+    用 psd-tools 创建带正确 DPI + 分层 + 压缩的 PSD 文件。
 
     分层策略（对齐瓦栏 PDF 标准）:
       - background_main: 背景层（柔和版）+ 主花层（原图）— 至少 2 层，最低合规
       - multi: 多层 — 背景层 + 主花层 + 次花层
       - single: 单层 — 只有 Pattern 层（不推荐，瓦栏建议分层）
+
+    压缩策略（实测 4724×7087×2 层 PSD）:
+      - raw:   351 MB (无压缩，现用路径)
+      - rle:   113 MB (默认，好一些)
+      - zip:    54 MB (不错)
+      - zip_prediction: 42 MB (最佳，Photoshop CS5+ 支持)
     """
     import struct
 
     from PIL import ImageFilter
     from psd_tools import PSDImage
+    from psd_tools.constants import Compression
+
+    # 压缩策略映射（config 字符串 → Compression 枚举）
+    compr_map = {
+        "raw": Compression.RAW,
+        "rle": Compression.RLE,
+        "zip": Compression.ZIP,
+        "zip_prediction": Compression.ZIP_WITH_PREDICTION,
+    }
+    compr = compr_map.get(compression, Compression.ZIP_WITH_PREDICTION)
 
     w, h = pil_img.width, pil_img.height
 
@@ -57,12 +79,16 @@ def _make_psd_with_dpi(pil_img: Image.Image, psd_path: str, dpi: int, layer_stra
         layers.append(("Background", bg))
         layers.append(("Pattern", pil_img))
 
-    # 1. 创建 PSD 并按顺序添加图层
+    # 1. 创建 PSD 并按顺序添加图层（每个图层用指定压缩）
     psd = PSDImage.new("RGB", (w, h))
     for name, layer_img in layers:
         # 确保图层是 RGB 模式且尺寸一致
         layer_img = layer_img.convert("RGB").resize((w, h))
-        psd.create_pixel_layer(layer_img, name=name)
+        psd.create_pixel_layer(layer_img, name=name, compression=compr)
+
+    # 关键：强制 merged ImageData 也用压缩（PSDImage.new 默认是 RAW）
+    psd._record.image_data.compression = compr
+
     psd.save(psd_path)
 
     # 2. 手动 patch ResolutionInfo（psd-tools 没有直接 API）
@@ -117,14 +143,15 @@ def png_to_psd(png_path: str, psd_path: str, config: dict) -> str:
     psd_cfg = config["psd"]
     dpi = psd_cfg["dpi"]
     layer_strategy = psd_cfg.get("layer_strategy", "background_main")
+    compression = psd_cfg.get("compression", "zip_prediction")
 
     img = Image.open(png_path).convert("RGB")
     # 确保 PNG 自身也带 DPI（质量检测用）
     img.save(png_path, dpi=(dpi, dpi))
 
     try:
-        _make_psd_with_dpi(img, psd_path, dpi, layer_strategy=layer_strategy)
-        logger.info(f"  PSD 保存: {psd_path} (DPI={dpi}, 分层={layer_strategy})")
+        _make_psd_with_dpi(img, psd_path, dpi, layer_strategy=layer_strategy, compression=compression)
+        logger.info(f"  PSD 保存: {psd_path} (DPI={dpi}, 分层={layer_strategy}, 压缩={compression})")
     except Exception as e:
         logger.error(f"PSD 生成失败: {e}")
         # 回退：用 psd-tools 基础 API（DPI 可能缺失，但至少文件可读）

@@ -101,6 +101,23 @@ def run_pipeline(config: dict, mode: str = "full") -> dict:
     logger.info(f"流水线启动 | 模式={mode}")
     start = time.time()
 
+    # 断点续跑（仅 full 模式启用）
+    ckpt = None
+    resume = False
+    if mode == "full" and config.get("pipeline", {}).get("resume", True):
+        from walan_design.checkpoint import CheckpointManager
+
+        ckpt = CheckpointManager(config)
+        logger.info(ckpt.summary())
+        resume = True
+
+    def _skip_if_done(step: str) -> bool:
+        """如果 checkpoint 显示 step 已完成，跳过并返回 True"""
+        if ckpt and ckpt.is_step_done(step):
+            logger.info(f"  ↳ {step} 已完成，跳过")
+            return True
+        return False
+
     output = {}
 
     # 尝试加载之前的中间产物（支持 design_only / upload_only 模式）
@@ -108,8 +125,11 @@ def run_pipeline(config: dict, mode: str = "full") -> dict:
     design_results = None
 
     if mode in ("full", "collect_only", "design_only"):
-        briefs = run_collect(config)
-        output["briefs"] = briefs
+        if not _skip_if_done("collect"):
+            briefs = run_collect(config)
+            output["briefs"] = briefs
+            if ckpt:
+                ckpt.mark_done("collect", len(briefs), "output/trends/")
 
     if mode == "collect_only":
         logger.info("collect_only 模式，流水线结束")
@@ -124,8 +144,11 @@ def run_pipeline(config: dict, mode: str = "full") -> dict:
                 config["trend"]["brief_count"],
                 config["design"]["style_preferences"],
             )
-        design_results = run_design(briefs, config)
-        output["design_results"] = design_results
+        if not _skip_if_done("design"):
+            design_results = run_design(briefs, config)
+            output["design_results"] = design_results
+            if ckpt:
+                ckpt.mark_done("design", len(design_results), "output/designs/")
 
     if mode == "design_only":
         logger.info("design_only 模式，流水线结束")
@@ -136,11 +159,36 @@ def run_pipeline(config: dict, mode: str = "full") -> dict:
             logger.error("upload_only 模式需要先运行 design_only 生成设计结果")
             return output
 
-        run_psd(design_results, config)
-        # 质量门必须真正过滤：只把通过检测的设计交给上传步骤
-        passed_results = run_check(design_results, config)
-        upload_info = run_upload(passed_results, config)
-        output["upload_info"] = upload_info
+        if not _skip_if_done("psd"):
+            run_psd(design_results, config)
+            if ckpt:
+                total_psd = sum(len(r.get("psd_paths", [])) for r in design_results)
+                ckpt.mark_done("psd", total_psd, "output/psd/")
+
+        if not _skip_if_done("check"):
+            # 质量门必须真正过滤：只把通过检测的设计交给上传步骤
+            passed_results = run_check(design_results, config)
+            if ckpt:
+                ckpt.mark_done("check", len(passed_results))
+        else:
+            passed_results = design_results
+
+        if not _skip_if_done("upload"):
+            upload_info = run_upload(passed_results, config)
+            output["upload_info"] = upload_info
+            if ckpt:
+                ckpt.mark_done("upload", upload_info.get("task_count", 0))
+
+            # 上传准备完成后（浏览器 agent 执行前），把指纹写入历史库
+            # 这样下一批跑 dedup 能和上一批比对
+            if upload_info.get("status") == "ready":
+                try:
+                    from walan_design.dedup_checker import record_published
+                    record_published(passed_results, config)
+                except Exception as e:
+                    logger.warning(f"  历史库写入失败（不阻塞）: {e}")
+        else:
+            upload_info = {}
 
     elapsed = time.time() - start
     logger.info("")

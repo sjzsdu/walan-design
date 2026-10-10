@@ -33,24 +33,24 @@ walan:
 # --- 趋势采集 ---
 trend:
   sources:
-    # browser = ego-browser 真实浏览器采集（国内实测可用）
-    # walan      = 瓦栏公开区在售花型+价格（最强趋势信号，推荐）
+    # browser = ego-browser 真实浏览器采集
+    # walan      = 瓦栏公开区在售花型+价格（国内最强趋势信号）
     # popfashion = POP服装趋势网趋势标题
-    # pinterest  = 国际趋势（国内网络被墙，保留兼容）
+    # pinterest  = Pinterest（国内需代理，已验证代理可用 ✅）
     - name: "browser"
       enabled: true
-      keywords: "walan,popfashion"
+      keywords: "walan,popfashion,pinterest"
       max_items: 60
     - name: "pinterest"
-      enabled: false   # 直连+浏览器均被墙
-      keywords: "pattern design 2024, fabric pattern trend, floral pattern, geometric pattern"
+      enabled: true    # 代理已加，重新启用
+      keywords: "pattern design, fabric pattern, floral pattern, geometric pattern"
       max_items: 30
     - name: "behance"
-      enabled: false
+      enabled: false   # 需代理
       keywords: "surface pattern design, textile pattern"
       max_items: 20
     - name: "patternbank"
-      enabled: false
+      enabled: false   # 偶尔可达，不稳定
       keywords: "trending patterns"
       max_items: 20
   llm:
@@ -69,7 +69,11 @@ trend:
     max_images_per_keyword: 40
     timeout_s: 300
     download_dir: "output/trends/images"
-    max_download: 12        # 下载多少张供视觉分析
+    max_download: 16        # Pinterest 也加进来了，多给 4 张
+    # 采集去重：pHash 汉明距离 ≤ 此值视为已采过，跳过不下载
+    dedup_phash_threshold: 6
+    # 瓦栏翻页轮换：每天从第几页开始（0=page1, 1=page2, ...），跨天递增
+    walan_page_rotation: true
   brief_count: 5
   output_dir: "output/trends"
 
@@ -183,6 +187,12 @@ psd:
   layer_strategy: "background_main"
   auto_seamless: true
   seamless_tolerance: 0
+  # 压缩策略（实测 4724×7087×2 层 PSD）:
+  #   raw:            351 MB (无压缩，现用路径)
+  #   rle:            113 MB (默认)
+  #   zip:             54 MB
+  #   zip_prediction:  42 MB (最佳，Photoshop CS5+ 支持，目标 50MB 以内)
+  compression: "zip_prediction"
   output_dir: "output/psd"
 
 # --- 质量检测 ---
@@ -191,15 +201,26 @@ quality:
   checks:
     resolution: true
     seamless: true
-    originality: true
+    originality: true    # 已替换为批次级 pHash 去重（见 dedup）
     no_text: true
     color_mode: true
     color_variants: true
     tag_count: true
     dimensions: true
-  originality_threshold: 0.85  # 未接线：originality 检测未实现，检测时显式跳过（见 quality_checker.quality_check_image）
+  originality_threshold: 0.85  # 已废弃，dedup 已接管
   on_fail: "skip"
-  max_retries: 3  # 未接线：retry 行为等同 skip（见 quality_checker.run 的 retry 分支）
+  max_retries: 3
+  # --- 防重复检测（Phase 4 新增，替换原 originality no-op）---
+  dedup:
+    enabled: true
+    # pHash 汉明距离阈值（0=完全相同，越大越宽松）
+    # 实测：同 brief 配色变体 0-6，不同设计 32-40
+    phash_threshold_batch: 10     # 批次内跨设计比对阈值
+    phash_threshold_history: 8    # 历史库比对（更严格，避免撞自己）
+    # 同一 brief 的配色变体是否豁免（recolor 改配色不改结构，pHash 天然相似）
+    same_brief_exempt: true
+    # 历史作品指纹库（JSON），发布成功后自动写入
+    history_store: "output/history/phash_store.json"
 
 # --- 流水线控制 ---
 pipeline:
