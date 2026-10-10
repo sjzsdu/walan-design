@@ -10,6 +10,7 @@
 """
 
 import logging
+import time
 from pathlib import Path
 
 logger = logging.getLogger("walan_design.upload")
@@ -47,6 +48,196 @@ def save_login_state(state_path: str = STATE_FILE, headless: bool = False) -> Pa
 
     print(f"✅ 登录态已保存到 {sp}")
     return sp
+
+
+def check_login_status(state_path: str = STATE_FILE) -> dict:
+    """检查登录态有效性，返回 {valid, reason, pending_count, works}
+
+    works: 控制台能看到的最新作品列表（设计号+标题，最多 10 条）
+    pending_count: "公开区(待审核)"状态的作品数
+    """
+    from playwright.sync_api import sync_playwright
+
+    sp = Path(state_path)
+    if not sp.exists():
+        return {"valid": False, "reason": f"登录态文件不存在: {sp}（请先运行 walan-design login）"}
+
+    age_min = (time.time() - sp.stat().st_mtime) / 60
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(storage_state=str(sp))
+        page = context.new_page()
+        try:
+            page.goto("https://www.walanwalan.com/console/designs/all/page1/", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_timeout(2500)
+            if "login" in page.url.lower():
+                browser.close()
+                return {
+                    "valid": False,
+                    "reason": f"登录已失效（storage_state 保存于 {age_min:.0f} 分钟前）。请重新运行 walan-design login",
+                }
+
+            # 已登录：抓作品状态统计
+            # 卡片标题在卡片文本首行（"1680457-赤陶热带叶_1"），img.alt 为空不可用；
+            # 侧栏有权威状态计数（全部 440 / 审核中 5 / VIP区 81 / 公开区 354 / 已下架 17）
+            info = page.evaluate(
+                """() => {
+                    const cards = [...document.querySelectorAll('[class*="imggrid_holder_"]')].slice(0, 20);
+                    const works = cards.map(c => {
+                        const m = c.className.match(/imggrid_holder_(\\d+)/);
+                        const lines = (c.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+                        let title = '';
+                        if (m) {
+                            const hit = lines.find(l => l.startsWith(m[1] + '-'));
+                            if (hit) title = hit.slice(m[1].length + 1, m[1].length + 31);
+                            else if (lines.length) title = lines[0].slice(0, 30);
+                        }
+                        const status = lines.find(l => /待审核|已下架|VIP区|公开区|新上传|密码区/.test(l)) || '';
+                        return {id: m ? m[1] : '', title, status};
+                    }).filter(w => w.id);
+                    const body = document.body.innerText;
+                    const cnt = (re) => { const m = body.match(re); return m ? parseInt(m[1]) : null; };
+                    const stats = {
+                        all: cnt(/全部\\s*(\\d+)/),
+                        reviewing: cnt(/审核中\\s*(\\d+)/),
+                        vip: cnt(/VIP区\\s*(\\d+)/),
+                        public: cnt(/公开区\\s*(\\d+)/),
+                        off: cnt(/已下架\\s*(\\d+)/),
+                    };
+                    return {works, stats};
+                }"""
+            )
+            browser.close()
+            stats = info.get("stats") or {}
+            pending = stats.get("reviewing")
+            if pending is None:  # 侧栏解析失败时按可见卡片兜底
+                pending = sum(1 for w in info.get("works", []) if "待审核" in w.get("status", ""))
+            return {
+                "valid": True,
+                "reason": f"登录有效（storage_state 已保存 {age_min:.0f} 分钟）",
+                "pending_count": pending or 0,
+                "stats": stats,
+                "works": info.get("works", []),
+            }
+        except Exception as e:
+            browser.close()
+            return {"valid": False, "reason": f"检查失败: {e}"}
+
+
+def _goto_designs_list(page, view: str = "all"):
+    """打开控制台列表页（瓦栏服务器偶尔响应慢，超时重试一次）
+
+    view: all=全部（默认） / off=已下架（下架后的作品会移出"全部"默认视图）
+    """
+    url = f"https://www.walanwalan.com/console/designs/{view}/page1/"
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    except Exception:
+        page.wait_for_timeout(2000)
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    # 卡片由 AJAX 异步渲染，必须等卡片出现而不是固定 sleep
+    try:
+        page.wait_for_selector('[class*="imggrid_holder_"]', timeout=20000)
+    except Exception:
+        pass  # 该视图无作品是正常的（如已下架视图为空）
+    page.wait_for_timeout(800)
+
+
+def takedown_designs(design_ids: list, state_path: str = STATE_FILE) -> list:
+    """下架指定设计号的作品
+
+    瓦栏后台没有删除功能（全页面无删除入口），状态变更只有：
+    公开区(2) / 密码区(4) / 已下架(9)。下架 = 从公开区撤回，
+    不再对外展示/售卖，待审核的中止审核；可随时重新上架。
+
+    返回 [{id, ok, detail}]
+    """
+    from playwright.sync_api import sync_playwright
+
+    ids = [str(i).strip() for i in design_ids if str(i).strip()]
+    if not ids:
+        return []
+
+    sp = Path(state_path)
+    if not sp.exists():
+        return [{"id": i, "ok": False, "detail": f"登录态文件不存在: {sp}（请先 walan-design login）"} for i in ids]
+
+    results = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(storage_state=str(sp))
+        page = context.new_page()
+        page.on("dialog", lambda d: d.accept())  # 自动接受 confirm/alert 弹窗
+
+        try:
+            _goto_designs_list(page)
+            if "login" in page.url.lower():
+                return [{"id": i, "ok": False, "detail": "登录已失效，请重新运行 walan-design login"} for i in ids]
+
+            for did in ids:
+                r = _takedown_one(page, did)
+                if not r["ok"] and "未找到" in r["detail"]:
+                    # "全部"视图找不到 → 查已下架视图（下架后的作品会移出"全部"默认视图）
+                    _goto_designs_list(page, view="off")
+                    if page.query_selector(f'[class*="imggrid_holder_{did}"]'):
+                        r = {"id": did, "ok": True, "detail": "该作品已处于下架状态，无需重复操作"}
+                    else:
+                        r = {"id": did, "ok": False, "detail": "全部/已下架视图第 1 页均未找到，请核对设计号（老作品可能翻页）"}
+                results.append(r)
+                # 每个作品下架后整页刷新过，重新加载列表页保证下次选卡干净
+                _goto_designs_list(page)
+        except Exception as e:
+            for i in ids[len(results):]:
+                results.append({"id": i, "ok": False, "detail": f"异常: {e}"})
+        finally:
+            browser.close()
+
+    return results
+
+
+def _takedown_one(page, did: str) -> dict:
+    """在已加载的列表页下架单个设计"""
+    card = page.query_selector(f'[class*="imggrid_holder_{did}"]')
+    if not card:
+        return {"id": did, "ok": False, "detail": "本页（第 1 页）未找到该设计号，老作品请翻页或核对设计号"}
+
+    card.click()
+    page.wait_for_timeout(600)
+    sel = page.evaluate("""() => document.querySelector(".txtcardids")?.value || "" """)
+    if did not in sel:
+        return {"id": did, "ok": False, "detail": f"选卡失败（txtcardids={sel!r}）"}
+
+    clicked = page.evaluate(
+        """() => {
+            const btns = [...document.querySelectorAll("button, a, input[type=button]")];
+            const btn = btns.find(b => b.textContent.trim() === "已下架");
+            if (!btn) return false;
+            btn.click();
+            return true;
+        }"""
+    )
+    if not clicked:
+        return {"id": did, "ok": False, "detail": "未找到下架按钮"}
+
+    page.wait_for_timeout(4500)
+    # 双重验证：确认文本 + 卡片状态文本
+    msg = page.evaluate(
+        """(did) => {
+            const m = document.body.innerText.match(new RegExp(did + "\\\\s*进入已下架"));
+            return m ? m[0] : null;
+        }""",
+        did,
+    )
+    st = page.evaluate(
+        """(did) => {
+            const c = document.querySelector('[class*="imggrid_holder_' + did + '"]');
+            return c ? c.innerText : "";
+        }""",
+        did,
+    )
+    if msg or "已下架" in st:
+        return {"id": did, "ok": True, "detail": msg or "卡片状态已变为已下架"}
+    return {"id": did, "ok": False, "detail": "已点击下架按钮但未确认到状态变化，请后台核对"}
 
 
 def _check_login(page) -> bool:

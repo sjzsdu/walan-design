@@ -114,6 +114,60 @@ def login(
     save_login_state(headless=headless)
 
 
+@app.command()
+def status():
+    """检查瓦栏登录态有效性 + 待审核作品概况"""
+    from walan_design.upload_executor import check_login_status
+
+    r = check_login_status()
+    if r["valid"]:
+        console.print(f"[green bold]✅ 登录有效[/green bold]  {r['reason']}")
+        stats = r.get("stats") or {}
+        parts = [
+            f"{label} {stats[k]}"
+            for k, label in [("all", "全部"), ("reviewing", "审核中"), ("public", "公开区"), ("vip", "VIP区"), ("off", "已下架")]
+            if stats.get(k) is not None
+        ]
+        if parts:
+            console.print("作品统计: " + " | ".join(parts))
+        works = r.get("works") or []
+        if works:
+            console.print("最近作品:")
+            for w in works[:10]:
+                st = w.get("status", "")
+                console.print(f"  [dim]{w['id']}[/dim]  {w['title'] or '(无标题)'}  [yellow]{st}[/yellow]")
+    else:
+        console.print(f"[red bold]❌ 登录无效[/red bold]  {r['reason']}")
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def delete(
+    design_ids: list[str] = typer.Argument(..., help="瓦栏设计号，可一次多个"),
+):
+    """下架已上传的瓦栏作品（平台无彻底删除功能）
+
+    下架后作品不再对外展示/售卖，待审核的中止审核；可随时在后台重新上架。
+
+    示例:
+      walan-design delete 1680458
+      walan-design delete 1680458 1680457
+    """
+    from walan_design.upload_executor import takedown_designs
+
+    console.print(f"下架 {len(design_ids)} 个作品...")
+    results = takedown_designs(design_ids)
+    for r in results:
+        mark = "[green]✓[/green]" if r["ok"] else "[red]✗[/red]"
+        console.print(f"{mark} [bold]{r['id']}[/bold]  {r['detail']}")
+
+    ok = sum(1 for r in results if r["ok"])
+    if ok == len(results):
+        console.print(f"\n[green bold]✓ {ok}/{len(results)} 个作品已下架[/green bold]")
+    else:
+        raise typer.Exit(code=1)
+
+
 # =====================================================
 # run — 完整流水线
 # =====================================================
@@ -123,6 +177,7 @@ def login(
 def run(
     count: int = typer.Option(None, "--count", "-n", help="生成花型数量"),
     mode: str = typer.Option("full", "--mode", "-m", help="运行模式: full / collect_only / design_only / upload_only"),
+    floral_type: str = typer.Option(None, "--type", "-t", help="强制花型类型: traditional(传统花型) / digital(数码花型) / mixed(混合,默认自动检测)"),
     log_level: str = typer.Option(None, "--log", "-l", help="日志级别: DEBUG / INFO / WARNING / ERROR"),
 ):
     """
@@ -143,10 +198,24 @@ def run(
 
     config["pipeline"]["mode"] = mode
 
+    if floral_type:
+        ft = floral_type.strip().lower()
+        if ft not in ("traditional", "digital", "mixed"):
+            console.print(f"[red]无效的 --type 值: {floral_type}[/red]")
+            console.print("可选: traditional / digital / mixed")
+            raise typer.Exit(code=1)
+        config["pipeline"]["force_floral_type"] = ft
+        # 同时给 Brief 生成的 brief_type，让 LLM 朝指定方向产出
+        config["design"] = config.get("design", {})
+        config["design"]["brief_type"] = ft
+        type_label = {"traditional": "传统花型", "digital": "数码花型", "mixed": "自动检测"}[ft]
+    else:
+        type_label = "自动检测"
+
     console.print(
         Panel.fit(
             f"[bold cyan]walan-design v0.1.0[/bold cyan]\n"
-            f"模式: [bold]{mode}[/bold]  |  批量: [bold]{config['trend']['brief_count']}[/bold]",
+            f"模式: [bold]{mode}[/bold]  |  批量: [bold]{config['trend']['brief_count']}[/bold]  |  类型: [bold]{type_label}[/bold]",
             border_style="green",
         )
     )
@@ -349,6 +418,110 @@ def upload(
         )
     else:
         console.print("[red]没有可上传的任务[/red]")
+
+
+# =====================================================
+# preview — 四方连续平铺预览
+# =====================================================
+
+
+@app.command()
+def preview(
+    target: str = typer.Argument(None, help="PNG 路径 / 花型目录 / 瓦栏设计号（留空=最近生成的花型目录）"),
+    width: float = typer.Option(1.5, "--width", "-w", help="预览画布宽度（米）"),
+    height: float = typer.Option(1.0, "--height", "-g", help="预览画布高度（米）"),
+    px_per_cm: int = typer.Option(20, "--pxcm", help="预览分辨率（像素/厘米），20 → 1.5m×1m ≈ 3000×2000px"),
+):
+    """四方连续平铺预览：按 40×60cm/格 平铺到指定物理大小（默认 1.5m 宽 × 1m 高），
+    模拟真实门幅，直接弹窗查看接回位是否有问题。不往项目目录写任何文件。
+
+    示例:
+      walan-design preview                # 预览最近一个花型的全部 PNG
+      walan-design preview 1680457        # 按瓦栏设计号预览（本地全分辨率）
+      walan-design preview output/runs/赤陶热带叶
+      walan-design preview 某图.png -w 2  # 自定义画布 2m×1m
+    """
+    from PIL import Image
+
+    from walan_design.ai_designer import set_seamless_method
+    from walan_design.preview import (
+        fetch_walan_image,
+        open_previews,
+        resolve_local_design,
+        tile_image,
+    )
+
+    config = _load_config()
+    _setup_logging("INFO")
+    set_seamless_method(config)  # make_seamless 需要 config 里的接回位算法设置
+
+    runs_dir = config.get("pipeline", {}).get("runs_dir", "output/runs")
+    t = (target or "").strip()
+
+    sources = []  # [(文件名, PNG 路径)]，设计号在线抓取时为 [(名, None)] + images 直传
+    remote_img = None
+    label = t or "最近花型"
+
+    if not t:
+        dirs = [d for d in Path(runs_dir).iterdir() if d.is_dir()] if Path(runs_dir).exists() else []
+        if not dirs:
+            console.print("[red]output/runs/ 下没有花型目录，请先运行 walan-design run 或指定 PNG/设计号[/red]")
+            raise typer.Exit(code=1)
+        target_dir = max(dirs, key=lambda d: d.stat().st_mtime)
+        console.print(f"[dim]未指定目标，使用最近的花型目录: {target_dir.name}[/dim]")
+        pngs = sorted(target_dir.glob("design_*.png")) or sorted(target_dir.glob("*.png"))
+        if not pngs:
+            console.print(f"[red]{target_dir} 下没有 PNG 文件[/red]")
+            raise typer.Exit(code=1)
+        sources = [(f"{target_dir.name}_{p.stem.replace('design_', 'v')}", p) for p in pngs]
+    elif t.isdigit():
+        did = t
+        local = resolve_local_design(did, runs_dir)
+        if local:
+            note = f"变体 _{local['variant']}" if local.get("variant") else "全部变体"
+            console.print(f"[dim]设计 {did} → 本地 {local['dir'].name}（{note}）[/dim]")
+            sources = [(f"{local['dir'].name}_{p.stem.replace('design_', 'v')}", p) for p in local["pngs"]]
+        else:
+            console.print(f"本地未找到设计 {did}，从瓦栏抓取缩略图（300×450，低分辨率，仅够粗看重复结构）...")
+            from walan_design.upload_executor import STATE_FILE
+
+            try:
+                remote_img = fetch_walan_image(did, STATE_FILE)
+            except RuntimeError as e:
+                console.print(f"[red]{e}[/red]")
+                raise typer.Exit(code=1)
+            label = f"walan_{did}"
+    else:
+        p = Path(t)
+        if p.is_dir():
+            pngs = sorted(p.glob("design_*.png")) or sorted(p.glob("*.png"))
+            if not pngs:
+                console.print(f"[red]{p} 下没有 PNG 文件[/red]")
+                raise typer.Exit(code=1)
+            sources = [(f"{p.name}_{q.stem.replace('design_', 'v')}", q) for q in pngs]
+        elif p.exists():
+            sources = [(p.stem, p)]
+        else:
+            console.print(f"[red]路径不存在: {p}[/red]")
+            raise typer.Exit(code=1)
+
+    console.print(f"平铺预览: {label} → {width}m×{height}m 画布（花型 40×60cm/格）")
+    named = []
+    if remote_img is not None:
+        named.append((label, tile_image(remote_img, width, height, px_per_cm)))
+    for name, path in sources:
+        try:
+            with Image.open(path) as img:
+                named.append((name, tile_image(img, width, height, px_per_cm)))
+        except Exception as e:
+            console.print(f"[yellow]跳过 {path}: {e}[/yellow]")
+
+    if not named:
+        console.print("[red]没有可预览的图片[/red]")
+        raise typer.Exit(code=1)
+
+    paths = open_previews(named)
+    console.print(f"[green bold]✓ 已打开 {len(paths)} 张预览（临时文件在系统 /tmp，项目目录零文件）[/green bold]")
 
 
 # =====================================================

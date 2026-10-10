@@ -47,7 +47,65 @@ def generate_placeholder(brief: dict, config: dict) -> list[Image.Image]:
 
 
 def make_seamless(img: Image.Image) -> Image.Image:
-    """快速版四方连续：numpy 加速的边缘镜像融合"""
+    """四方连续接回位：offset 四象限偏移 + 中央宽幅融合（默认）
+
+    原理：把图按 4 象限重拼（左上↔右下互换），接缝从边缘移到画面中央。
+    外边缘变成原图内部 → 平铺天然无缝（左右边缘是原图相邻列，零差异）；
+    只需对中央十字缝做宽幅双向融合。两侧都是原图真实内容，交叉淡化
+    远比边缘镜像自然（镜像会产生人眼极敏感的对称痕迹，渐变图还会有
+    颜色挤压带）。
+
+    config: psd.seamless_method = "offset"（默认）| "mirror"（旧版边缘镜像）
+    """
+    # method 由调用方注入（避免读 config），全局变量由 set_seamless_method 设置
+    method = _SEAMLESS_METHOD[0] if _SEAMLESS_METHOD[0] else "offset"
+    if method == "mirror":
+        return _make_seamless_mirror(img)
+
+    # ---- offset 四象限偏移 ----
+    w, h = img.size
+    hw, hh = w // 2, h // 2
+    result = Image.new(img.mode, (w, h))
+    result.paste(img.crop((0, 0, hw, hh)), (hw, hh))       # 左上 → 右下
+    result.paste(img.crop((hw, 0, w, hh)), (0, hh))        # 右上 → 左下
+    result.paste(img.crop((0, hh, hw, h)), (hw, 0))        # 左下 → 右上
+    result.paste(img.crop((hw, hh, w, h)), (0, 0))         # 右下 → 左上
+
+    # ---- 中央十字宽幅双向融合 ----
+    arr = np.array(result).astype(np.float32)
+    blend = max(w // 8, 64)  # 比边缘法宽一倍：中央融合区可观察、可用大渐变
+
+    # 垂直缝（x=hw）：缝两侧各 blend 宽度做线性交叉淡化
+    for x in range(blend):
+        # 距缝的距离 0..blend → alpha 从 0.5 到 0（缝上两侧各占一半）
+        a = 0.5 * (1 - x / blend)
+        L = arr[:, hw - 1 - x, :]   # 缝左侧
+        R = arr[:, hw + x, :]       # 缝右侧
+        arr[:, hw - 1 - x, :] = L * (1 - a) + R * a
+        arr[:, hw + x, :] = R * (1 - a) + L * a
+
+    # 水平缝（y=hh）：同理（在垂直融合后的 arr 上做，十字交汇处自然平滑）
+    for y in range(blend):
+        a = 0.5 * (1 - y / blend)
+        T = arr[hh - 1 - y, :, :]
+        B = arr[hh + y, :, :]
+        arr[hh - 1 - y, :, :] = T * (1 - a) + B * a
+        arr[hh + y, :, :] = B * (1 - a) + T * a
+
+    return Image.fromarray(arr.astype(np.uint8))
+
+
+# seamless_method 注入点（pipeline 里 set_seamless_method(config) 调用）
+_SEAMLESS_METHOD = [None]
+
+
+def set_seamless_method(config: dict):
+    method = config.get("psd", {}).get("seamless_method", "offset")
+    _SEAMLESS_METHOD[0] = method if method in ("offset", "mirror") else "offset"
+
+
+def _make_seamless_mirror(img: Image.Image) -> Image.Image:
+    """旧版：边缘镜像融合（数学上边缘相等，但有镜像对称痕迹）"""
     arr = np.array(img).astype(np.float32)
     h, w = arr.shape[:2]
     blend = max(w // 16, 32)
@@ -184,7 +242,8 @@ def run(briefs: list, config: dict = None) -> list:
         # 3. 接回位（必须在放大之后：LANCZOS 插值会重新引入边缘差异，
         # 放大前融合的接缝到最终图上会退化，见 quality check seamless FAIL 复盘）
         if config["psd"].get("auto_seamless", True):
-            logger.info("  处理四方连续接回位...")
+            set_seamless_method(config)
+            logger.info(f"  处理四方连续接回位 (method={_SEAMLESS_METHOD[0]})...")
             try:
                 upscaled = [make_seamless(img) for img in upscaled]
             except Exception as e:

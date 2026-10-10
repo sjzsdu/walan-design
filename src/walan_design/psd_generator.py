@@ -319,7 +319,11 @@ def png_to_psd(png_path: str, psd_path: str, config: dict, floral_type: str = No
     # auto 策略：按花型类型自动选分层方式
     if layer_strategy == "auto":
         if floral_type is None:
-            floral_type = _detect_floral_type(img, psd_cfg.get("fidelity_threshold", 0.95))
+            force_type = config.get("pipeline", {}).get("force_floral_type")
+            if force_type in ("traditional", "digital"):
+                floral_type = force_type
+            else:
+                floral_type = _detect_floral_type(img, psd_cfg.get("fidelity_threshold", 0.95))
         layer_strategy = "color_layers" if floral_type == "traditional" else "background_main"
         logger.info(f"  auto 分层: {floral_type} → {layer_strategy}")
 
@@ -367,11 +371,17 @@ def process_design_result(result: dict, config: dict) -> dict:
     # auto 策略时检测一次花型类型，整个设计的所有变体共用
     # （同一设计的 4 个配色变体风格一致，类型相同）
     floral_type = None
-    if config["psd"].get("layer_strategy", "auto") == "auto" and result.get("image_paths"):
+    force_type = config.get("pipeline", {}).get("force_floral_type")
+    if force_type in ("traditional", "digital"):
+        # 强制指定：跳过检测，直接用
+        floral_type = force_type
+        logger.info(f"  花型类型: 强制指定 {floral_type}（跳过自动检测）")
+    elif config["psd"].get("layer_strategy", "auto") == "auto" and result.get("image_paths"):
         floral_type = _detect_floral_type(
             Image.open(result["image_paths"][0]),
             config["psd"].get("fidelity_threshold", 0.95),
         )
+    if floral_type:
         result["floral_type"] = floral_type
 
     for i, png_path in enumerate(result["image_paths"]):

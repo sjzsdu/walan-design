@@ -207,7 +207,14 @@ psd:
   # 严格单色层：true=每层纯色填充（制版合规，层内单色）；false=保留层内纹理（可能多色）
   pure_color_layers: true
   auto_seamless: true
-  seamless_tolerance: 0
+  # 平铺边缘平均差异容差（0-255）：offset 接回位的接缝=原图内部相邻列，
+  # 天然有 ~1-3 灰阶差异（视觉不可见）；mirror 法可设 0（精确相等）
+  seamless_tolerance: 3
+  # 接回位算法:
+  #   offset = 四象限偏移 + 中央宽幅融合（默认，推荐）
+  #            接缝移到画面中央处理，外边缘平铺天然无缝，无镜像对称痕迹
+  #   mirror = 旧版边缘镜像融合（渐变图会有颜色挤压带、大母题有对称痕迹）
+  seamless_method: "offset"
   # 压缩策略（实测 4724×7087×2 层 PSD）:
   #   raw:            351 MB (无压缩，现用路径)
   #   rle:            113 MB (默认)
