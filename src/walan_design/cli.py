@@ -235,7 +235,7 @@ def design(
 
 @app.command()
 def psd(
-    input_dir: str = typer.Argument(None, help="PNG 图片目录（留空用 output/designs/）"),
+    input_dir: str = typer.Argument(None, help="PNG 图片目录（留空则重新生成设计）"),
 ):
     """将 AI 生成的 PNG 转换为符合瓦栏规范的 PSD 文件"""
     from walan_design.psd_generator import run as psd_run
@@ -275,7 +275,7 @@ def psd(
 
 @app.command()
 def upload(
-    input_dir: str = typer.Argument(None, help="PSD 目录（留空用 output/psd/）"),
+    input_dir: str = typer.Argument(None, help="PSD 目录（留空用 output/runs/ 下已有花型）"),
 ):
     """准备瓦栏上传任务（生成 browser_use prompt，实际浏览器操作由 ego-lite 执行）"""
     from walan_design.walan_uploader import run as upload_run
@@ -293,13 +293,29 @@ def upload(
             for p in psds
         ]
     else:
-        from walan_design.ai_designer import run as design_run
-        from walan_design.psd_generator import run as psd_run
-        from walan_design.trend_collector import _local_fallback_briefs
-
-        briefs = _local_fallback_briefs(1, config["design"]["style_preferences"])
-        results = design_run(briefs, config)
-        psd_run(results, config)
+        # 从集中目录 output/runs/{标题}/ 读取已生成的花型（每个取 _1.psd 主图）
+        runs_dir = Path(config.get("pipeline", {}).get("runs_dir", "output/runs"))
+        results = []
+        for run_dir in sorted(runs_dir.iterdir()) if runs_dir.exists() else []:
+            if not run_dir.is_dir():
+                continue
+            main_psd = run_dir / f"{run_dir.name}_1.psd"
+            if main_psd.exists():
+                # brief 信息从花型目录里的 brief.json 恢复
+                brief = {}
+                brief_file = run_dir / "brief.json"
+                if brief_file.exists():
+                    brief = json.loads(brief_file.read_text(encoding="utf-8"))
+                results.append(
+                    {
+                        "brief": brief,
+                        "run_dir": str(run_dir),
+                        "psd_paths": [str(main_psd)],
+                    }
+                )
+        if not results:
+            console.print("[yellow]output/runs/ 下没有已生成的花型，请先运行 walan-design run[/yellow]")
+            return
 
     console.print("准备瓦栏上传任务...")
     info = upload_run(results, config)

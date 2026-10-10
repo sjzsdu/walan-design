@@ -211,11 +211,19 @@ def run(briefs: list, config: dict = None) -> list:
             logger.warning(f"  配色变体生成失败: {e}")
             all_images = upscaled
 
-        # 5. 保存
+        # 5. 保存：集中到每个花型一个目录 output/runs/{title}/
+        import json
+
+        run_dir = Path(config.get("pipeline", {}).get("runs_dir", "output/runs")) / title
+        run_dir.mkdir(parents=True, exist_ok=True)
+        # 花型目录里也保存一份 brief.json 和 visual_review.json
+        (run_dir / "brief.json").write_text(json.dumps(brief, ensure_ascii=False, indent=2), encoding="utf-8")
+        (run_dir / "visual_review.json").write_text(json.dumps(critiques, ensure_ascii=False, indent=2), encoding="utf-8")
+
         image_paths = []
         dpi = config["psd"]["dpi"]
         for j, img in enumerate(all_images):
-            fp = output_dir / f"{title}_{j + 1}.png"
+            fp = run_dir / f"design_{j + 1}.png"
             img.save(str(fp), "PNG", dpi=(dpi, dpi))
             image_paths.append(str(fp))
             logger.info(f"  保存: {fp} ({img.width}×{img.height})")
@@ -223,6 +231,7 @@ def run(briefs: list, config: dict = None) -> list:
         results.append(
             {
                 "brief": brief,
+                "run_dir": str(run_dir),
                 "image_paths": image_paths,
                 "base_image_count": len(upscaled),
                 "color_variant_count": len(all_images) - len(upscaled),

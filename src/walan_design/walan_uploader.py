@@ -80,8 +80,13 @@ def prepare_upload_tasks(design_results: list, config: dict) -> list:
             "zone": zone,
             "upload_url": walan_cfg["upload_url"],
         }
+        # 花型类型 → 瓦栏分类联动（传统=按色分层 PSD 选"传统花型"，数码选"数码花型"）
+        floral_type = result.get("floral_type")
+        if floral_type:
+            task["floral_type"] = floral_type
+            task["category_name"] = "传统花型" if floral_type == "traditional" else "数码花型"
         tasks.append(task)
-        logger.info(f"  准备上传任务: {title} → {psd_path}")
+        logger.info(f"  准备上传任务: {title} → {psd_path}" + (f" [{task['category_name']}]" if floral_type else ""))
 
     return tasks
 
@@ -99,6 +104,7 @@ def build_browser_prompt(task: dict) -> str:
     price = task["price"]
     zone_text = "公开区" if task["zone"] == "public" else "VIP区"
     upload_url = task["upload_url"]
+    category = task.get("category_name", "数码花型")
 
     prompt = f"""请帮我完成瓦栏花型上传操作：
 
@@ -107,12 +113,14 @@ def build_browser_prompt(task: dict) -> str:
 3. 在文件选择对话框中选择文件：{psd_path}
 4. 等待文件上传完成
 5. 填写花型名称：{title}
-6. 选择售卖类型：{sell_type_text}
-7. 选择价格档位：买断{price["buyout"]}元，下载{price["download"]}元，PSD{price["psd"]}元
-8. 添加标签：{tags}
-9. 点击"上传"或"提交"按钮
-10. 上传成功后，将花型发布到{zone_text}
+6. 在"分类"下拉框中选择：{category}
+7. 选择售卖类型：{sell_type_text}
+8. 选择价格档位：买断{price["buyout"]}元，下载{price["download"]}元，PSD{price["psd"]}元
+9. 添加标签：{tags}
+10. 点击"上传"或"提交"按钮
+11. 上传成功后，将花型发布到{zone_text}
 
+注意：此花型的 PSD 是{"按颜色分色分层（每主色一层透明图层）" if category == "传统花型" else "背景+主花分层"}，分类必须选"{category}"，与分层方式匹配。
 请逐步完成每一步操作，每步等待页面加载完成后再继续下一步。
 """
     return prompt
@@ -177,14 +185,28 @@ def run(design_results: list, config: dict = None) -> dict:
         logger.info(f"  标签: {', '.join(task.get('tags', []))}")
         logger.info(f"  发布区: {task['zone']}")
 
-    # 3. 保存任务文件
-    task_file = save_upload_tasks(tasks, config)
+    # 3. 每个花型目录存一份 upload.json（集中存放）
+    global_tasks = []
+    for task, prompt, result in zip(tasks, prompts, design_results):
+        run_dir = result.get("run_dir")
+        if run_dir:
+            upload_file = Path(run_dir) / "upload.json"
+            upload_file.write_text(
+                json.dumps({"task": task, "prompt": prompt}, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        global_tasks.append(task)
 
-    # 4. 保存 prompts 供 pipeline 调用
-    output_dir = Path(config["psd"]["output_dir"]).parent / "temp"
+    # 4. 全局汇总索引（pipeline/checkpoint 用），仍放 temp
+    output_dir = Path(config.get("pipeline", {}).get("temp_dir", "output/temp"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    task_file = output_dir / f"upload_tasks_{timestamp}.json"
+    with open(task_file, "w", encoding="utf-8") as f:
+        json.dump({"timestamp": timestamp, "task_count": len(global_tasks), "tasks": global_tasks}, f, ensure_ascii=False, indent=2)
+
     prompt_file = output_dir / "upload_prompts.json"
     with open(prompt_file, "w", encoding="utf-8") as f:
-        json.dump([{"title": t["title"], "prompt": p} for t, p in zip(tasks, prompts)], f, ensure_ascii=False, indent=2)
+        json.dump([{"title": t["title"], "prompt": p} for t, p in zip(global_tasks, prompts)], f, ensure_ascii=False, indent=2)
 
     logger.info("\n上传准备完成:")
     logger.info(f"  任务数: {len(tasks)}")

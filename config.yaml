@@ -74,11 +74,15 @@ trend:
     dedup_phash_threshold: 6
     # 瓦栏翻页轮换：每天从第几页开始（0=page1, 1=page2, ...），跨天递增
     walan_page_rotation: true
-  brief_count: 5
+  brief_count: 1
   output_dir: "output/trends"
 
 # --- AI 花型设计 ---
 design:
+  # 花型类型偏向：traditional（传统花型，颜色离散、按色制版） /
+  #   digital（数码花型，渐变丰富、全彩不受限） /
+  #   mixed（混合，让 LLM 根据趋势图自选，推荐）
+  brief_type: "mixed"
   # 供应商选择：stability / dalle / stable_diffusion
   # stability: 云端 SDXL API（推荐，质量高，~$0.03/张）
   # dalle: OpenAI DALL-E 3（接入简单，~$0.04-0.12/张）
@@ -184,7 +188,24 @@ upscaler:
 psd:
   dpi: 300
   color_mode: "RGB"
-  layer_strategy: "background_main"
+  # 分层策略:
+  #   auto            = 自动判断（推荐）：检测花型颜色离散度，
+  #                     传统花型（颜色集中）→ 按色分色分层，
+  #                     数码花型（渐变丰富）→ 背景层+主花层
+  #   color_layers    = 强制按颜色分色分层（传统花型制版标准，每主色一层透明图层）
+  #   background_main = 强制背景层+主花层（数码花型）
+  layer_strategy: "auto"
+  # auto 判定阈值：median-cut 量化到 8 色后的还原度（1-平均误差/255）
+  # 还原度 >= 此值判为传统花型（颜色离散，可按色制版）；否则判为数码花型
+  fidelity_threshold: 0.95
+  # color_layers 策略的主色数量（自适应起始值，传统花型一般 6-12 色）
+  color_layer_count: 8
+  # 自适应加色上限（层内色差超标时自动增加，最多到此值）
+  max_color_count: 12
+  # 层内平均色差容差（0-255，超过则加色重试；越小单色越严格、层数越多）
+  color_tolerance: 8
+  # 严格单色层：true=每层纯色填充（制版合规，层内单色）；false=保留层内纹理（可能多色）
+  pure_color_layers: true
   auto_seamless: true
   seamless_tolerance: 0
   # 压缩策略（实测 4724×7087×2 层 PSD）:
@@ -224,8 +245,10 @@ quality:
 
 # --- 流水线控制 ---
 pipeline:
-  batch_count: 5
+  batch_count: 1
   manual_review: false
   mode: "full"
   log_level: "INFO"
   temp_dir: "output/temp"
+  # 花型集中目录：每个花型一个子目录，存放 PNG/PSD/brief/upload 等全部产物
+  runs_dir: "output/runs"

@@ -11,6 +11,7 @@
 """
 
 import argparse
+import json
 import logging
 import time
 from pathlib import Path
@@ -103,13 +104,11 @@ def run_pipeline(config: dict, mode: str = "full") -> dict:
 
     # 断点续跑（仅 full 模式启用）
     ckpt = None
-    resume = False
     if mode == "full" and config.get("pipeline", {}).get("resume", True):
         from walan_design.checkpoint import CheckpointManager
 
         ckpt = CheckpointManager(config)
         logger.info(ckpt.summary())
-        resume = True
 
     def _skip_if_done(step: str) -> bool:
         """如果 checkpoint 显示 step 已完成，跳过并返回 True"""
@@ -124,31 +123,55 @@ def run_pipeline(config: dict, mode: str = "full") -> dict:
     briefs = None
     design_results = None
 
+    # 中间产物落盘：checkpoint 只记"做没做完"，产物本身存 JSON，
+    # 中断恢复时据此还原（否则 design 标记 done 但内存无结果，后续全卡死）
+    temp_dir = Path(config["pipeline"].get("temp_dir", "output/temp"))
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    def _save_step(name: str, data):
+        (temp_dir / name).write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def _load_step(name: str):
+        p = temp_dir / name
+        if not p.exists():
+            return None
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"  {name} 读取失败，将重新生成: {e}")
+            return None
+
     if mode in ("full", "collect_only", "design_only"):
         if not _skip_if_done("collect"):
             briefs = run_collect(config)
+            _save_step("briefs.json", briefs)
             output["briefs"] = briefs
             if ckpt:
                 ckpt.mark_done("collect", len(briefs), "output/trends/")
+        else:
+            briefs = _load_step("briefs.json")
 
     if mode == "collect_only":
         logger.info("collect_only 模式，流水线结束")
         return output
 
     if mode in ("full", "design_only"):
-        if briefs is None:
-            # 用本地 fallback 测试用
-            from walan_design.trend_collector import _local_fallback_briefs
-
-            briefs = _local_fallback_briefs(
-                config["trend"]["brief_count"],
-                config["design"]["style_preferences"],
-            )
         if not _skip_if_done("design"):
+            if briefs is None:
+                # collect 标记 done 但 briefs.json 丢失 → 重新采集（纯本地操作）
+                briefs = run_collect(config)
+                _save_step("briefs.json", briefs)
+                if ckpt:
+                    ckpt.mark_done("collect", len(briefs), "output/trends/")
             design_results = run_design(briefs, config)
+            _save_step("design_results.json", design_results)
             output["design_results"] = design_results
             if ckpt:
                 ckpt.mark_done("design", len(design_results), "output/designs/")
+        else:
+            design_results = _load_step("design_results.json")
 
     if mode == "design_only":
         logger.info("design_only 模式，流水线结束")
@@ -156,11 +179,30 @@ def run_pipeline(config: dict, mode: str = "full") -> dict:
 
     if mode in ("full", "upload_only"):
         if design_results is None:
-            logger.error("upload_only 模式需要先运行 design_only 生成设计结果")
-            return output
+            if mode == "upload_only":
+                logger.error("upload_only 模式需要先运行 design_only 生成设计结果")
+                return output
+            # full 模式：checkpoint 标 design done 但产物丢失 → 重跑 design 而不是卡死
+            logger.warning("  design 结果缺失（checkpoint 标记 done 但产物丢失），重新执行 design 步骤")
+            if ckpt:
+                ckpt.reset("design")
+            if briefs is None:
+                briefs = _load_step("briefs.json")
+            if briefs is None:
+                # collect 标 done 但 briefs.json 也丢失 → 重新采集
+                briefs = run_collect(config)
+                _save_step("briefs.json", briefs)
+                if ckpt:
+                    ckpt.mark_done("collect", len(briefs), "output/trends/")
+            design_results = run_design(briefs, config)
+            _save_step("design_results.json", design_results)
+            output["design_results"] = design_results
+            ckpt.mark_done("design", len(design_results), "output/designs/")
 
         if not _skip_if_done("psd"):
             run_psd(design_results, config)
+            # psd 步骤会检测 floral_type 写入 result，重新落盘保持一致
+            _save_step("design_results.json", design_results)
             if ckpt:
                 total_psd = sum(len(r.get("psd_paths", [])) for r in design_results)
                 ckpt.mark_done("psd", total_psd, "output/psd/")

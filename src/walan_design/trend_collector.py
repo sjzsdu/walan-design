@@ -153,6 +153,28 @@ def analyze_with_llm(trend_data: list, config: dict) -> list:
     llm_cfg = config["trend"]["llm"]
     brief_count = config["trend"]["brief_count"]
     style_prefs = config["design"]["style_preferences"]
+    brief_type = config["design"].get("brief_type", "mixed")
+
+    # 花型类型约束词
+    type_hint = {
+        "traditional": (
+            "【全部为传统花型】颜色离散、层次分明，整个花型只有 5-10 个固定主色，"
+            "适合按色制版（一色一网版）。sd_prompt 用 flat vector、gouache、silkscreen print、"
+            "limited palette、crisp edges 等词，避免 gradient、photorealistic、blurry。"
+        ),
+        "digital": (
+            "【全部为数码花型】渐变丰富、色彩细腻过渡，可模拟照片质感或水彩晕染，"
+            "不受颜色数限制。sd_prompt 用 photorealistic、watercolor wash、gradient、"
+            "digital painting、smooth transition、rich color variation 等词。"
+        ),
+        "mixed": (
+            "【混合类型】每个 brief 根据参考图的气质自选合适类型："
+            "- 传统花型：颜色离散、层次分明、按色制版风。sd_prompt 加 flat vector / limited palette / crisp edges"
+            "- 数码花型：渐变丰富、照片级/水彩晕染风。sd_prompt 加 photorealistic / gradient / watercolor wash"
+            "请至少生成 1/3 数码花型 brief。"
+        ),
+    }.get(brief_type, "")
+
     trend_summary = json.dumps(
         [{k: v for k, v in item.items() if k != "src"} for item in trend_data[:50]],
         ensure_ascii=False,
@@ -161,6 +183,8 @@ def analyze_with_llm(trend_data: list, config: dict) -> list:
 
     system_prompt = f"""你是一位有 15 年经验的纺织花型设计师兼趋势分析师，服务国际面料市场（女装、家纺、童装）。
 根据以下真实采集的趋势数据（含 Pinterest 流行花型的图片描述），生成 {brief_count} 个花型设计 Brief。
+
+{type_hint}
 
 专业要求：
 - 目标市场：{style_prefs["target_market"]}
@@ -179,6 +203,7 @@ def analyze_with_llm(trend_data: list, config: dict) -> list:
 - theme: 主题描述（中文，30字以内）
 - colors: 配色方案（英文逗号分隔的具体颜色名，如 terracotta, sage green, cream）
 - style: 风格关键词（英文）
+- floral_type: "traditional" 或 "digital"（根据你的 brief 内容判断）
 - sd_prompt: Stable Diffusion 的英文 prompt（以 seamless pattern 开头）
 - tags: 适合的瓦栏标签（从这些中选择：几何、动物、抽象、植物、花卉、田园、蝴蝶、豹纹、卡通、传统花卉）
 """
