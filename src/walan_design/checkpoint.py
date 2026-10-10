@@ -47,12 +47,38 @@ class CheckpointManager:
         temp_dir = Path(config.get("pipeline", {}).get("temp_dir", "output/temp"))
         temp_dir.mkdir(parents=True, exist_ok=True)
         self.path = temp_dir / "checkpoint.json"
+        self.archive_dir = temp_dir / "checkpoint_archive"
         self.data = self._load()
+
+        # 上一批全部完成 → 归档旧 checkpoint，自动开新一批
+        # （断点续跑只针对"中断恢复"；跑完的批次不应该挡住下一次运行）
+        if self._all_done():
+            self._archive()
+            self.data = self._new_state()
+            self.save()
+            logger.info("上一批已全部完成，开启新一批")
 
         if pipeline_id and self.data.get("pipeline_id") != pipeline_id:
             # 新流水线：覆盖旧状态
             self.data = self._new_state(pipeline_id)
             self.save()
+
+    def _all_done(self) -> bool:
+        """所有实际步骤都 done（upscale/recolor 是旧版残留步骤，忽略）"""
+        steps = self.data.get("steps", {})
+        active = [s for s in self.STEPS if s not in ("upscale", "recolor")]
+        return all(steps.get(s, {}).get("status") == "done" for s in active) and bool(steps)
+
+    def _archive(self):
+        """把已完成的 checkpoint 归档（留档不删除，供追溯）"""
+        try:
+            self.archive_dir.mkdir(parents=True, exist_ok=True)
+            pid = self.data.get("pipeline_id", "unknown")
+            dst = self.archive_dir / f"checkpoint_{pid}.json"
+            dst.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info(f"旧 checkpoint 已归档: {dst}")
+        except OSError as e:
+            logger.warning(f"checkpoint 归档失败（忽略）: {e}")
 
     def _load(self) -> dict:
         if self.path.exists():

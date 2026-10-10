@@ -100,6 +100,21 @@ def _set_config_value(key_path: str, new_value: str):
 
 
 # =====================================================
+# login — 瓦栏登录态保存
+# =====================================================
+
+
+@app.command()
+def login(
+    headless: bool = typer.Option(False, "--headless", "-h", help="headless 模式（默认 headed 方便手动登录）"),
+):
+    """打开 headed 浏览器登录瓦栏，保存 storage_state 供后续自动上传复用"""
+    from walan_design.upload_executor import save_login_state
+
+    save_login_state(headless=headless)
+
+
+# =====================================================
 # run — 完整流水线
 # =====================================================
 

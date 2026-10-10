@@ -229,6 +229,44 @@ def run_pipeline(config: dict, mode: str = "full") -> dict:
                     record_published(passed_results, config)
                 except Exception as e:
                     logger.warning(f"  历史库写入失败（不阻塞）: {e}")
+
+            # 真实上传执行（ego-browser）：auto_upload 开启时逐任务上传到瓦栏
+            if (
+                upload_info.get("status") == "ready"
+                and config.get("pipeline", {}).get("auto_upload", False)
+                and upload_info.get("tasks")
+            ):
+                from walan_design.upload_executor import execute_upload
+
+                upload_results = []
+                for task in upload_info["tasks"]:
+                    # 上次失败过的任务：文件已在服务器，skip_upload 续跑管理+发布
+                    for pr in passed_results:
+                        if pr.get("brief", {}).get("title") == task["title"] and pr.get("run_dir"):
+                            prev = Path(pr["run_dir"]) / "upload_result.json"
+                            if prev.exists():
+                                try:
+                                    if not json.loads(prev.read_text(encoding="utf-8")).get("ok", False):
+                                        task["skip_upload"] = True
+                                        logger.info(f"  ↳ {task['title']} 上次上传失败，从已上传列表续跑")
+                                except (json.JSONDecodeError, OSError):
+                                    pass
+                            break
+                    r = execute_upload(task, config)
+                    upload_results.append({"title": task["title"], **r})
+                    if r.get("ok"):
+                        logger.info(f"  ✅ 上传成功: {task['title']} → {r.get('detail')}")
+                    else:
+                        logger.error(f"  ❌ 上传失败: {task['title']} [{r.get('step')}] {r.get('detail')}")
+                output["upload_results"] = upload_results
+                # 结果也落盘到各花型目录
+                for r, res in zip(upload_info["tasks"], upload_results):
+                    for pr in passed_results:
+                        if pr.get("brief", {}).get("title") == r["title"] and pr.get("run_dir"):
+                            (Path(pr["run_dir"]) / "upload_result.json").write_text(
+                                json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8"
+                            )
+                            break
         else:
             upload_info = {}
 
