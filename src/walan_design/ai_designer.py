@@ -4,6 +4,7 @@ AI 花型设计模块
 生成花型图片 → AI 视觉自评（低分重生成）→ 超分辨率放大 → 接回位 → 一花四色（专业调色板）
 """
 
+import json
 import logging
 from pathlib import Path
 
@@ -63,34 +64,39 @@ def make_seamless(img: Image.Image) -> Image.Image:
         return _make_seamless_mirror(img)
 
     # ---- offset 四象限偏移 ----
+    # 注意：w/h 可能是奇数（4724×7087 高为奇数），四个区域必须完整覆盖整图，
+    # 否则最后一行/列不会被任何象限写入（表现为底边黑线、上下边缘差异巨大）
     w, h = img.size
     hw, hh = w // 2, h // 2
     result = Image.new(img.mode, (w, h))
-    result.paste(img.crop((0, 0, hw, hh)), (hw, hh))       # 左上 → 右下
-    result.paste(img.crop((hw, 0, w, hh)), (0, hh))        # 右上 → 左下
-    result.paste(img.crop((0, hh, hw, h)), (hw, 0))        # 左下 → 右上
-    result.paste(img.crop((hw, hh, w, h)), (0, 0))         # 右下 → 左上
+    result.paste(img.crop((0, 0, hw, hh)), (w - hw, h - hh))   # 左上 → 右下
+    result.paste(img.crop((hw, 0, w, hh)), (0, h - hh))        # 右上 → 左下
+    result.paste(img.crop((0, hh, hw, h)), (w - hw, 0))        # 左下 → 右上
+    result.paste(img.crop((hw, hh, w, h)), (0, 0))             # 右下 → 左上
+    # 拼合缝位置：竖缝 x=w-hw，横缝 y=h-hh（奇数尺寸时偏离正中）
 
     # ---- 中央十字宽幅双向融合 ----
     arr = np.array(result).astype(np.float32)
+    sx, sy = w - hw, h - hh
     blend = max(w // 8, 64)  # 比边缘法宽一倍：中央融合区可观察、可用大渐变
+    blend = min(blend, sx, sy, w - sx, h - sy)  # 防小图越界
 
-    # 垂直缝（x=hw）：缝两侧各 blend 宽度做线性交叉淡化
+    # 垂直缝（x=sx）：缝两侧各 blend 宽度做线性交叉淡化
     for x in range(blend):
         # 距缝的距离 0..blend → alpha 从 0.5 到 0（缝上两侧各占一半）
         a = 0.5 * (1 - x / blend)
-        L = arr[:, hw - 1 - x, :]   # 缝左侧
-        R = arr[:, hw + x, :]       # 缝右侧
-        arr[:, hw - 1 - x, :] = L * (1 - a) + R * a
-        arr[:, hw + x, :] = R * (1 - a) + L * a
+        L = arr[:, sx - 1 - x, :]   # 缝左侧
+        R = arr[:, sx + x, :]       # 缝右侧
+        arr[:, sx - 1 - x, :] = L * (1 - a) + R * a
+        arr[:, sx + x, :] = R * (1 - a) + L * a
 
-    # 水平缝（y=hh）：同理（在垂直融合后的 arr 上做，十字交汇处自然平滑）
+    # 水平缝（y=sy）：同理（在垂直融合后的 arr 上做，十字交汇处自然平滑）
     for y in range(blend):
         a = 0.5 * (1 - y / blend)
-        T = arr[hh - 1 - y, :, :]
-        B = arr[hh + y, :, :]
-        arr[hh - 1 - y, :, :] = T * (1 - a) + B * a
-        arr[hh + y, :, :] = B * (1 - a) + T * a
+        T = arr[sy - 1 - y, :, :]
+        B = arr[sy + y, :, :]
+        arr[sy - 1 - y, :, :] = T * (1 - a) + B * a
+        arr[sy + y, :, :] = B * (1 - a) + T * a
 
     return Image.fromarray(arr.astype(np.uint8))
 
@@ -193,39 +199,92 @@ def run(briefs: list, config: dict = None) -> list:
     output_dir.mkdir(parents=True, exist_ok=True)
     sd_cfg = design_cfg.get("stable_diffusion", {})
 
-    # 初始化供应商（传入 design 子树：各供应商的配置块都在 design.* 命名空间下）
-    provider = None
-    try:
-        provider = ImageProvider.create(engine, design_cfg)
-        if provider.health_check():
-            logger.info(f"✓ 供应商 {provider.name} 可用")
-        else:
-            logger.warning(f"供应商 {engine} 不可用，将使用占位图")
-            provider = None
-    except Exception as e:
-        logger.warning(f"供应商初始化失败: {e}，将使用占位图")
-
     # 放大配置
     upscaler_cfg = config.get("upscaler", {})
     upscale_method = upscaler_cfg.get("method", "lanczos")
     target_dpi = upscaler_cfg.get("target_dpi", 300)
 
+    from walan_design.diagnostics import is_hard_failure, provider_blocked, record_attention
+
+    # 断点续跑（设计级）：先扫一遍哪些设计已有完整产物（design_result.json 标记）。
+    # 全部已有产物时不需要生图供应商 —— 余额耗尽也能把后续 PSD/质检/上传跑完。
+    runs_dir = Path(config.get("pipeline", {}).get("runs_dir", "output/runs"))
+
+    def _marker_result(brief: dict):
+        title = brief.get("title", "")
+        marker = runs_dir / title / "design_result.json"
+        if not marker.exists():
+            return None
+        try:
+            prev = json.loads(marker.read_text(encoding="utf-8"))
+            if prev.get("image_paths") and all(Path(p).exists() for p in prev["image_paths"]):
+                return prev
+        except (json.JSONDecodeError, OSError):
+            pass
+        return None
+
+    cached = {i: _marker_result(b) for i, b in enumerate(briefs)}
+    need_generation = any(v is None for v in cached.values())
+
+    # 初始化供应商（传入 design 子树：各供应商的配置块都在 design.* 命名空间下）
+    provider = None
+    allow_placeholder = design_cfg.get("allow_placeholder", False)
+    init_err = ""
+    if need_generation:
+        try:
+            provider = ImageProvider.create(engine, design_cfg)
+            if provider.health_check():
+                logger.info(f"✓ 供应商 {provider.name} 可用")
+            else:
+                init_err = getattr(provider, "health_reason", "") or f"供应商 {engine} 健康检查未通过"
+                logger.error(f"✗ {init_err}")
+                provider = None
+        except Exception as e:
+            init_err = f"{type(e).__name__}: {e}"
+            logger.warning(f"供应商初始化失败: {e}")
+
+        if provider is None and not allow_placeholder:
+            # 硬故障直接中止：余额耗尽/key 失效时用假图跑完全批只会产出废品
+            # （2026-10-11 事故：余额 $0.001 静默跑完 25 个废品 PSD）
+            raise provider_blocked(engine, init_err)
+    else:
+        logger.info("全部设计已有完整产物（断点续跑），跳过生图供应商初始化")
+
     results = []
+    failures = []  # 软故障记录 [{title, reason}]：单设计失败被跳过
     for i, brief in enumerate(briefs):
         title = brief.get("title", f"design_{i + 1}")
         logger.info(f"\n=== 设计 {i + 1}/{len(briefs)}: {title} ===")
 
+        # 步骤级 checkpoint 只保证"design 步骤重跑"，这里保证步骤内每个设计不重做
+        if cached.get(i) is not None:
+            logger.info(f"  ↳ 断点续跑：已有完整产物（{len(cached[i]['image_paths'])} 张图），跳过生成")
+            results.append(cached[i])
+            continue
+
         # 1. AI 生图 + 视觉自评闭环
         images, critiques = [], []
+        gen_err = ""
         if provider is not None:
             try:
                 images, critiques = _generate_with_review(provider, brief, config, sd_cfg, common)
             except Exception as e:
+                gen_err = f"{type(e).__name__}: {e}"
+                if is_hard_failure(str(e)):
+                    # 余额耗尽/key 失效/网络断：后续每个设计都会同样失败，立即中止
+                    raise provider_blocked(engine, str(e)) from e
                 logger.error(f"  供应商生成失败: {e}")
 
         if not images:
-            logger.warning("使用占位图")
-            images = generate_placeholder(brief, config)
+            if allow_placeholder:
+                logger.warning("使用占位图（design.allow_placeholder=true，仅调试用）")
+                images = generate_placeholder(brief, config)
+            else:
+                reason = f"AI 生图失败: {gen_err}" if gen_err else "AI 生图失败（未返回图片）"
+                logger.error(f"  {reason}，跳过该设计")
+                record_attention(config, f"生图:{title}", reason)
+                failures.append({"title": title, "reason": reason})
+                continue
 
         # 2. 超分辨率放大
         logger.info(f"  超分辨率放大 (method={upscale_method}, target_dpi={target_dpi})...")
@@ -271,9 +330,7 @@ def run(briefs: list, config: dict = None) -> list:
             all_images = upscaled
 
         # 5. 保存：集中到每个花型一个目录 output/runs/{title}/
-        import json
-
-        run_dir = Path(config.get("pipeline", {}).get("runs_dir", "output/runs")) / title
+        run_dir = runs_dir / title
         run_dir.mkdir(parents=True, exist_ok=True)
         # 花型目录里也保存一份 brief.json 和 visual_review.json
         (run_dir / "brief.json").write_text(json.dumps(brief, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -287,16 +344,24 @@ def run(briefs: list, config: dict = None) -> list:
             image_paths.append(str(fp))
             logger.info(f"  保存: {fp} ({img.width}×{img.height})")
 
-        results.append(
-            {
-                "brief": brief,
-                "run_dir": str(run_dir),
-                "image_paths": image_paths,
-                "base_image_count": len(upscaled),
-                "color_variant_count": len(all_images) - len(upscaled),
-                "provider": provider.name if provider else "placeholder",
-                "visual_review": critiques,  # 自评记录（含最终得分与建议）
-            }
+        result = {
+            "brief": brief,
+            "run_dir": str(run_dir),
+            "image_paths": image_paths,
+            "base_image_count": len(upscaled),
+            "color_variant_count": len(all_images) - len(upscaled),
+            "provider": provider.name if provider else "placeholder",
+            "visual_review": critiques,  # 自评记录（含最终得分与建议）
+        }
+        # 完成标记：全部 PNG 落盘后才写，供断点续跑时跳过该设计
+        (run_dir / "design_result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        results.append(result)
+
+    # 软故障汇总：显著提示 + CLI 结束时渲染黄色面板（attention.json）
+    if failures:
+        logger.warning(
+            f"\n⚠️ {len(failures)}/{len(briefs)} 个设计生成失败被跳过，本批产出不完整:\n"
+            + "\n".join(f"  - {f['title']}: {f['reason'][:120]}" for f in failures)
         )
 
     return results

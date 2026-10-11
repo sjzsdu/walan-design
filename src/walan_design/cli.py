@@ -20,6 +20,7 @@ from walan_design.pipeline import (
     run_pipeline,
     setup_logging,
 )
+from walan_design.diagnostics import PipelineBlocked, diagnose_error, take_attention
 
 app = typer.Typer(
     name="walan-design",
@@ -34,6 +35,56 @@ err_console = Console(stderr=True)
 # =====================================================
 # 辅助函数
 # =====================================================
+
+
+def _run_error_panel(exc: Exception, config: dict):
+    """未诊断异常 → 尽量给出可读原因"""
+    diagnosed = diagnose_error(str(exc))
+    if diagnosed:
+        _interruption_panel(config, "流水线中断", diagnosed[0], diagnosed[1])
+    else:
+        _interruption_panel(
+            config,
+            "流水线中断",
+            f"{type(exc).__name__}: {exc}",
+            ["往上翻日志，找最后一个 ERROR/WARNING 定位出问题的环节"],
+        )
+
+
+def _interruption_panel(config: dict, title: str, cause: str, solutions: list[str]):
+    """
+    中断面板：出了什么问题 / 当前进度 / 怎么解决 / 断点续跑命令。
+    保证任何中断后用户都知道「要做什么 + 用什么命令继续」。
+    """
+    from walan_design.diagnostics import checkpoint_progress
+
+    progress = checkpoint_progress(config)
+    body = f"[bold red]出了什么问题[/bold red]\n  {cause}\n"
+    if progress:
+        body += f"\n[bold]当前进度[/bold]\n  {progress}\n"
+    body += (
+        "\n[bold yellow]怎么解决[/bold yellow]\n"
+        + "\n".join(f"  [bold cyan]{i}.[/bold cyan] {s}" for i, s in enumerate(solutions, 1))
+        + f"\n\n[dim]断点续跑:[/dim] [bold cyan]walan-design run[/bold cyan]"
+        f"[dim]（自动从中断处继续：已采集的趋势、已生成的花型会跳过，不重复扣费）[/dim]"
+    )
+    console.print(Panel(body, title=f"❌ {title}", border_style="red", padding=(1, 2)))
+
+
+def _report_attention(config: dict):
+    """运行结束后的软故障汇总（黄色面板）：跳过的设计 / 失败的上传 / 降级的环节"""
+    notes = take_attention(config)
+    if not notes:
+        return
+    lines = []
+    for i, n in enumerate(notes, 1):
+        lines.append(f"[bold]{i}. [{n['stage']}][/bold] {n['message']}")
+        for s in n.get("solutions") or []:
+            lines.append(f"   [bold cyan]→[/bold cyan] {s}")
+        lines.append("")
+    console.print(
+        Panel("\n".join(lines).rstrip(), title="⚠️ 本次运行有需要你处理的问题", border_style="yellow", padding=(1, 2))
+    )
 
 
 def _load_config() -> dict:
@@ -222,11 +273,26 @@ def run(
 
     try:
         result = run_pipeline(config, mode=mode)
-        console.print("\n[green bold]✓ 完成[/green bold]")
-        return result
+    except PipelineBlocked as e:
+        # 硬故障（余额耗尽/key 失效/网络断）：红色面板给出原因、进度与续跑命令
+        _interruption_panel(config, e.title, e.cause, e.solutions)
+        sys.exit(1)
     except KeyboardInterrupt:
-        console.print("\n[yellow]已中断[/yellow]")
+        _interruption_panel(
+            config,
+            "流水线已中断",
+            "手动中断（Ctrl+C）",
+            ["如需继续，直接执行下方的断点续跑命令"],
+        )
         sys.exit(130)
+    except Exception as e:
+        _run_error_panel(e, config)
+        sys.exit(1)
+
+    console.print("\n[green bold]✓ 完成[/green bold]")
+    # 软故障汇总：跳过的设计 / 失败的上传 / 降级的环节
+    _report_attention(config)
+    return result
 
 
 # =====================================================
@@ -294,7 +360,11 @@ def design(
         briefs = _local_fallback_briefs(config["trend"]["brief_count"], config["design"]["style_preferences"])
 
     console.print(f"AI 生图: {len(briefs)} 个设计")
-    results = run_design(briefs, config)
+    try:
+        results = run_design(briefs, config)
+    except PipelineBlocked as e:
+        _interruption_panel(config, e.title, e.cause, e.solutions)
+        raise typer.Exit(code=1)
 
     # 漂亮展示
     table = Table(title="生成结果")

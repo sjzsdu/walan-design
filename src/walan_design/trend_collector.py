@@ -220,6 +220,14 @@ def analyze_with_llm(trend_data: list, config: dict) -> list:
 
     if not api_key:
         logger.warning(f"未配置 {env_var}，使用本地规则生成 Brief")
+        from walan_design.diagnostics import record_attention
+
+        record_attention(
+            config,
+            "趋势分析",
+            f"未配置 {env_var}，Brief 降级为本地模板（花型质量会明显下降）",
+            [f"设置 {env_var} 环境变量或在 config.yaml trend.llm.api_key 填入 key", "重跑: walan-design run -m collect_only"],
+        )
         return _local_fallback_briefs(brief_count, style_prefs)
 
     # 视觉分析：趋势数据里带真实下载图片时，直接给视觉模型看图
@@ -324,6 +332,13 @@ def analyze_with_llm(trend_data: list, config: dict) -> list:
         return normalized[:brief_count]
     except Exception as e:
         logger.error(f"LLM 分析失败: {e}")
+        from walan_design.diagnostics import record_attention
+
+        record_attention(
+            config,
+            "趋势分析",
+            f"LLM 分析失败，Brief 降级为本地模板: {e}",
+        )
         return _local_fallback_briefs(brief_count, style_prefs)
 
 

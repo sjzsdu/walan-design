@@ -193,4 +193,7 @@ def critique_image(image: Image.Image, brief: dict, config: dict) -> dict:
         return result
     except Exception as e:
         logger.warning(f"视觉自评失败（fail-open）: {e}")
+        from walan_design.diagnostics import record_attention
+
+        record_attention(config, "视觉自评", f"AI 视觉自评失败已跳过（低分重生成机制本次失效）: {e}")
         return fail_open

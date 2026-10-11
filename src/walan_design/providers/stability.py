@@ -19,6 +19,7 @@ Stability AI API 供应商 — 使用最新 v2beta 接口
 import io
 import logging
 import os
+import re
 
 import requests
 from PIL import Image
@@ -57,6 +58,17 @@ def _select_2_3_resolution() -> tuple[int, int]:
     return best or (832, 1216)
 
 
+def _classify_http_error(status: int, msg: str) -> str:
+    """把 HTTP 状态码翻译成带根因的错误文本（diagnostics.is_hard_failure 按此文本分流）"""
+    if status == 401:
+        return f"Stability API key 无效（HTTP 401）: {msg}"
+    if status in (402, 429) and re.search(r"(?i)credit|balance", msg):
+        return f"Stability 账户余额不足（HTTP {status}）: {msg}"
+    if status == 429:
+        return f"Stability 请求频率超限（HTTP 429）: {msg}"
+    return f"Stability API {status}: {msg}"
+
+
 # config 里的模型名归一化：分支判定只认 core / ultra / sdxl-v1
 MODEL_ALIASES = {
     "sdxl-1.0": "sdxl-v1",
@@ -82,6 +94,9 @@ class StabilityProvider(ImageProvider):
         # 默认用 Core（性价比最高），可设 ultra / core / sdxl-v1
         raw_model = (config.get("stability", {}).get("model", "core") or "core").strip().lower()
         self.model = MODEL_ALIASES.get(raw_model, raw_model)
+        # 预检结果（health_check 写入，诊断信息用）
+        self.health_reason = ""
+        self.balance_credits = None
         logger.info(f"Stability provider: model={self.model}, endpoint={self._endpoint_for(self.model)}")
 
     def _endpoint_for(self, model: str) -> str:
@@ -93,31 +108,38 @@ class StabilityProvider(ImageProvider):
         return f"{self.API_BASE}/stable-image/generate/core"
 
     def health_check(self) -> bool:
-        """简化版：有 key 就认为可用，真正连通性在 generate 时验证"""
+        """
+        同步预检：key 存在性 + 余额/有效性验证。
+        余额耗尽 / key 失效在这里直接拦下（写 health_reason 供诊断信息），
+        避免跑到一半才失败。余额端点异常时不阻塞，生图时再验证。
+        """
         if not self.api_key:
+            self.health_reason = "Stability API key 未设置（config.yaml design.stability.api_key 或环境变量 STABILITY_API_KEY）"
             return False
-        # 异步尝试查余额，但不阻塞——key 存在即返回 True
         try:
-            import threading
-
-            def _check():
-                try:
-                    resp = requests.get(
-                        f"{self.API_BASE}/user/balance",
-                        headers={"Authorization": f"Bearer {self.api_key}"},
-                        timeout=5,
+            resp = requests.get(
+                f"{self.API_BASE}/user/balance",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                credits = float(resp.json().get("credits", 1e9))
+                self.balance_credits = credits
+                logger.info(f"  Stability 余额: {credits:.3f} credits")
+                if credits < 0.01:
+                    self.health_reason = (
+                        f"Stability 账户余额不足（剩余 {credits} credits，单张生成约需 0.009）"
                     )
-                    if resp.status_code == 200:
-                        credits = resp.json().get("credits", "?")
-                        logger.info(f"  Stability 余额: {credits} credits")
-                    elif resp.status_code == 404:
-                        logger.info("  Stability API key 有效（余额端点 404 但 key 没问题）")
-                except Exception:
-                    pass
-
-            threading.Thread(target=_check, daemon=True).start()
-        except Exception:
-            pass
+                    return False
+            elif resp.status_code == 404:
+                logger.info("  Stability API key 有效（余额端点 404 但 key 没问题）")
+            elif resp.status_code in (401, 403):
+                self.health_reason = f"Stability API key 无效或无权限（HTTP {resp.status_code}）"
+                return False
+            else:
+                logger.warning(f"  Stability 余额预检返回 HTTP {resp.status_code}（不阻塞，生图时再验证）")
+        except Exception as e:
+            logger.warning(f"  Stability 余额预检失败（不阻塞，生图时再验证）: {e}")
         return True
 
     def generate(self, params: GenerationParams) -> GenerationResult:
@@ -176,7 +198,7 @@ class StabilityProvider(ImageProvider):
                     msg = err.get("name", "") + ": " + err.get("errors", [""])[0]
                 except Exception:
                     msg = resp.text[:200]
-                raise RuntimeError(f"Stability API {resp.status_code}: {msg}")
+                raise RuntimeError(_classify_http_error(resp.status_code, msg))
 
             # Core/Ultra 返回单张 image/png
             images = []
@@ -238,7 +260,7 @@ class StabilityProvider(ImageProvider):
                     msg = str(err.get("message", ""))[:200]
                 except Exception:
                     msg = resp.text[:200]
-                raise RuntimeError(f"Stability API {resp.status_code}: {msg}")
+                raise RuntimeError(_classify_http_error(resp.status_code, msg))
 
             data = resp.json()
             images = []

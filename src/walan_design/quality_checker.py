@@ -67,28 +67,42 @@ def check_resolution(img_path: str, min_dpi: int = 200) -> tuple[bool, str]:
 
 def check_seamless(img_path: str, tolerance: int = 1) -> tuple[bool, str]:
     """
-    检查四方连续接回位质量。
-    方法：比较左边缘和右边缘的像素差异、上边缘和下边缘的像素差异。
-    如果差异在容差内，认为接回位合格。
+    检查四方连续接回位质量（双信号，均自适应纹理活跃度）：
+    1. 像素级：边缘像素差 vs 内部相邻行/列像素差基线
+       （offset 接回位边缘=原图内部相邻列，差异≈基线；mirror 精确相等）
+    2. 结构级：边缘行/列的均值差 vs 相邻行/列均值差基线
+       （行均值对几千像素取平均，天然平滑——黑线/未接边会形成巨大离群值，
+        高纹理图上像素级信号会被纹理噪声吸收，结构级信号不受影响）
     """
     try:
         img = load_image(img_path)
-        arr = np.array(img)
+        arr = np.asarray(img.convert("RGB"))
         h, w = arr.shape[:2]
 
-        # 比较左右边缘（各取 1 像素宽）
-        left_edge = arr[:, 0, :].astype(float)
-        right_edge = arr[:, w - 1, :].astype(float)
-        h_diff = np.mean(np.abs(left_edge - right_edge))
+        # 结构级：行/列均值序列（每行对数千像素取均值）
+        row_means = arr.mean(axis=(1, 2), dtype=np.float64)
+        col_means = arr.mean(axis=(0, 2), dtype=np.float64)
+        row_base = float(np.abs(np.diff(row_means)).mean()) + 1e-6
+        col_base = float(np.abs(np.diff(col_means)).mean()) + 1e-6
+        v_gap = abs(float(row_means[0]) - float(row_means[-1]))  # 上下边缘
+        h_gap = abs(float(col_means[0]) - float(col_means[-1]))  # 左右边缘
 
-        # 比较上下边缘
-        top_edge = arr[0, :, :].astype(float)
-        bottom_edge = arr[h - 1, :, :].astype(float)
-        v_diff = np.mean(np.abs(top_edge - bottom_edge))
+        # 像素级：边缘差异 vs 内部相邻行/列基线（抽样 256 控制开销）
+        v_pix = float(np.abs(arr[0].astype(np.int16) - arr[h - 1].astype(np.int16)).mean())
+        h_pix = float(np.abs(arr[:, 0].astype(np.int16) - arr[:, w - 1].astype(np.int16)).mean())
+        rs = np.linspace(0, h - 2, 256, dtype=int)
+        cs = np.linspace(0, w - 2, 256, dtype=int)
+        v_base = float(np.abs(arr[rs].astype(np.int16) - arr[rs + 1].astype(np.int16)).mean())
+        h_base = float(np.abs(arr[:, cs].astype(np.int16) - arr[:, cs + 1].astype(np.int16)).mean())
 
-        avg_diff = (h_diff + v_diff) / 2
-        passed = avg_diff <= tolerance
-        return passed, f"平均边缘差异={avg_diff:.2f} (容差={tolerance})"
+        v_lim, h_lim = max(float(tolerance), 2.0 * v_base + 5.0), max(float(tolerance), 2.0 * h_base + 5.0)
+        v_mlim, h_mlim = max(6.0, 20.0 * row_base), max(6.0, 20.0 * col_base)
+        passed = (v_pix <= v_lim and h_pix <= h_lim and v_gap <= v_mlim and h_gap <= h_mlim)
+        detail = (
+            f"左右 像素差={h_pix:.1f}/{h_lim:.1f} 均值差={h_gap:.1f}/{h_mlim:.1f} | "
+            f"上下 像素差={v_pix:.1f}/{v_lim:.1f} 均值差={v_gap:.1f}/{v_mlim:.1f}"
+        )
+        return passed, detail
     except Exception as e:
         return False, f"接回位检测异常: {e}"
 

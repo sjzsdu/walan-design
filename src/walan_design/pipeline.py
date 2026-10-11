@@ -210,6 +210,15 @@ def run_pipeline(config: dict, mode: str = "full") -> dict:
         if not _skip_if_done("check"):
             # 质量门必须真正过滤：只把通过检测的设计交给上传步骤
             passed_results = run_check(design_results, config)
+            if not passed_results:
+                from walan_design.diagnostics import record_attention
+
+                record_attention(
+                    config,
+                    "质量检测",
+                    "本批所有设计均未通过质检，没有进入上传环节（各项 ✗ 详情见上方日志）",
+                    ["查看日志中每个文件的具体 ✗ 项（常见：接回位/DPI/比例）", "确认原因后重跑: walan-design run"],
+                )
             if ckpt:
                 ckpt.mark_done("check", len(passed_results))
         else:
@@ -258,6 +267,9 @@ def run_pipeline(config: dict, mode: str = "full") -> dict:
                         logger.info(f"  ✅ 上传成功: {task['title']} → {r.get('detail')}")
                     else:
                         logger.error(f"  ❌ 上传失败: {task['title']} [{r.get('step')}] {r.get('detail')}")
+                        from walan_design.diagnostics import record_attention
+
+                        record_attention(config, f"上传:{task['title']}", f"[{r.get('step')}] {r.get('detail')}")
                 output["upload_results"] = upload_results
                 # 结果也落盘到各花型目录
                 for r, res in zip(upload_info["tasks"], upload_results):
