@@ -237,7 +237,15 @@ def run_pipeline(config: dict, mode: str = "full") -> dict:
                     from walan_design.dedup_checker import record_published
                     record_published(passed_results, config)
                 except Exception as e:
-                    logger.warning(f"  历史库写入失败（不阻塞）: {e}")
+                    logger.warning(f"  pHash 历史库写入失败（不阻塞）: {e}")
+
+                # 同时把 brief 写入历史库，下次 LLM 生成时主动避开重复主题
+                try:
+                    from walan_design.brief_history import append_briefs
+                    briefs_to_record = [pr.get("brief", {}) for pr in passed_results if pr.get("brief")]
+                    append_briefs(briefs_to_record, config)
+                except Exception as e:
+                    logger.warning(f"  brief 历史库写入失败（不阻塞）: {e}")
 
             # 真实上传执行（ego-browser）：auto_upload 开启时逐任务上传到瓦栏
             if (

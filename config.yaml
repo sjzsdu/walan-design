@@ -277,6 +277,9 @@ quality:
     same_brief_exempt: true
     # 历史作品指纹库（JSON），发布成功后自动写入
     history_store: "output/history/phash_store.json"
+    # Brief 历史库：记录已生成主题，下次 LLM 生成时主动避开重复（语义级去重，比 pHash 更前置）
+    brief_history_store: "output/history/brief_store.json"
+    brief_history_size: 50       # 历史上限（条），避免 prompt 膨胀；0=关闭
 
 # --- 流水线控制 ---
 pipeline:

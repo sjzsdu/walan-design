@@ -149,6 +149,17 @@ def _local_fallback_briefs(count: int, style_prefs: dict) -> list:
     return templates[:count]
 
 
+def _build_history_exclusion(config: dict) -> str:
+    """加载 brief 历史库，格式化为 LLM 排除指令。空历史返回空串。"""
+    try:
+        from walan_design.brief_history import format_for_prompt
+
+        return format_for_prompt(config, max_items=20)
+    except Exception as e:
+        logger.debug(f"brief_history 加载失败（可忽略）: {e}")
+        return ""
+
+
 def analyze_with_llm(trend_data: list, config: dict) -> list:
     llm_cfg = config["trend"]["llm"]
     brief_count = config["trend"]["brief_count"]
@@ -187,6 +198,8 @@ def analyze_with_llm(trend_data: list, config: dict) -> list:
 
     system_prompt = f"""你是一位有 15 年经验的纺织花型设计师兼趋势分析师，服务国际面料市场（女装、家纺、童装）。
 根据以下真实采集的趋势数据（含 Pinterest 流行花型的图片描述），生成 {brief_count} 个花型设计 Brief。
+
+{_build_history_exclusion(config)}
 
 {type_hint}
 
