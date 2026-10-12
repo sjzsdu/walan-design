@@ -163,9 +163,13 @@ def analyze_with_llm(trend_data: list, config: dict) -> list:
             "limited palette、crisp edges 等词，避免 gradient、photorealistic、blurry。"
         ),
         "digital": (
-            "【全部为数码花型】渐变丰富、色彩细腻过渡，可模拟照片质感或水彩晕染，"
-            "不受颜色数限制。sd_prompt 用 photorealistic、watercolor wash、gradient、"
+            "【全部为数码花型】数码直喷印花，无套色限制，渐变丰富、色彩细腻过渡，"
+            "水彩晕染/墨色渗透/通透层次。sd_prompt 必须含 watercolor wash、gradient、"
             "digital painting、smooth transition、rich color variation 等词。"
+            "严禁出现 flat vector、line hatching、hatching、silkscreen、screen print、"
+            "block print、woodblock、gouache、limited palette、flat colors 等传统平涂/分色词汇"
+            "（2026-10-11 事故：数码 brief 写出 flat vector style + hand-drawn line hatching，"
+            "产出传统花型长相）。"
         ),
         "mixed": (
             "【混合类型】每个 brief 根据参考图的气质自选合适类型："
@@ -193,10 +197,12 @@ def analyze_with_llm(trend_data: list, config: dict) -> list:
 - 花型必须原创、贴合当下真实流行趋势（不要凭空想象过时款式）
 - 必须能做四方连续无缝拼接
 - sd_prompt 必须用纺织设计行业标准术语，具体描述：主体母题（motif）的形态与排布方式、
-  底色与主色（给出具体色彩名）、笔触/质感（如 hand-painted gouache, flat vector, watercolor wash）、
+  底色与主色（给出具体色彩名）、笔触/质感（传统花型如 hand-painted gouache, flat vector；
+  数码花型只能用 watercolor wash, soft gradients, painterly brushstrokes）、
   母题密度（如 dense allover, spaced tossed）、参考印花工艺（如 digital print style）。
   禁止只写 "beautiful pattern" 这类空话。长度 40-70 词。
-- 描述里出现 nautical、 Retro 等具体风格词时优先吸收进 sd_prompt
+- 描述里出现 nautical、Retro 等具体风格词时优先吸收进 sd_prompt，
+  但风格词不得改变花型类型——数码花型无论什么题材都必须保持渐变晕染质感，不得平涂
 
 请返回 JSON 数组，每个元素包含：
 - title: 花型名称（中文，10字以内）

@@ -4,7 +4,8 @@ API: http://127.0.0.1:7860/sdapi/v1/txt2img
 
 优势:
   - 免费（不花 API 费）
-  - ControlNet 支持无缝平铺
+  - 原生 tiling（circular padding）：UNet 生成时看到环形连续内容，
+    生成即严格四方连续、母题绕边自然延续——按构造保证，不靠后处理
   - 完全可控（模型/LoRA/采样器全可调）
 
 劣势:
@@ -30,7 +31,7 @@ class SDWebUIProvider(ImageProvider):
 
     name = "stable_diffusion"
     max_resolution = (2048, 2048)
-    supports_tiling = True  # 通过 ControlNet tile
+    supports_tiling = True  # 原生 tiling（A1111 payload["tiling"]）；ControlNet tile 为备选
     supports_2_3_ratio = True
 
     def __init__(self, config: dict):
@@ -39,7 +40,14 @@ class SDWebUIProvider(ImageProvider):
         self.checkpoint = config.get("stable_diffusion", {}).get("checkpoint", "")
         self.use_controlnet = config.get("stable_diffusion", {}).get("use_controlnet", True)
         self.controlnet_model = config.get("stable_diffusion", {}).get("controlnet_model", "control_v11p_sd15_tile")
-        logger.info(f"SD WebUI provider: api_url={self.api_url}, checkpoint={self.checkpoint or '<server default>'}")
+        # 平铺模式：native = A1111 原生 tiling（推荐，circular padding 按构造四方连续）；
+        # controlnet = 旧 ControlNet tile 方案（需另装 SD1.5 ControlNet 模型）
+        self.tiling_mode = config.get("stable_diffusion", {}).get("tiling_mode", "native")
+        self.timeout = int(config.get("stable_diffusion", {}).get("timeout_s", 900))
+        logger.info(
+            f"SD WebUI provider: api_url={self.api_url}, checkpoint={self.checkpoint or '<server default>'}, "
+            f"tiling_mode={self.tiling_mode}"
+        )
 
     def health_check(self) -> bool:
         try:
@@ -60,8 +68,12 @@ class SDWebUIProvider(ImageProvider):
             "sampler_name": "DPM++ 2M Karras",
         }
 
-        # ControlNet 无缝平铺
-        if params.tiling and self.use_controlnet:
+        # 无缝平铺：优先 A1111 原生 tiling（circular padding，按构造四方连续）
+        if params.tiling and self.tiling_mode == "native":
+            payload["tiling"] = True
+
+        # 备选：ControlNet tile（需 SD1.5 + control_v11p_sd15_tile 模型）
+        if params.tiling and self.tiling_mode == "controlnet" and self.use_controlnet:
             payload["alwayson_scripts"] = {
                 "ControlNet": {
                     "args": [
@@ -77,7 +89,7 @@ class SDWebUIProvider(ImageProvider):
         logger.info(f"  SD WebUI: {params.prompt[:60]}... ({params.width}×{params.height})")
 
         try:
-            resp = requests.post(f"{self.api_url}/sdapi/v1/txt2img", json=payload, timeout=180)
+            resp = requests.post(f"{self.api_url}/sdapi/v1/txt2img", json=payload, timeout=self.timeout)
             resp.raise_for_status()
             result = resp.json()
 

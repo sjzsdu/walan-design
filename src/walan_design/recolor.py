@@ -1,14 +1,17 @@
 """
-一花四色专业化 — 调色板驱动的重着色（替代简单 HSV 偏移）。
+一花四色专业化 — 按花型类型分路的重着色。
 
-原理：
+传统花型（palette 模式）：
 1. 图片量化为 N 个主色簇（median-cut）
 2. 目标调色板按明度排序，作为"明度→颜色"的渐变坡道
 3. 每个主色簇按其明度位置映射到坡道上的目标色
 4. 像素级重映射时保留原始明暗纹理（局部明度/簇明度 缩放），细节不糊
+效果：变体配色直接来自专业配色方案（瓦栏流行色系），符合按色制版。
 
-效果：变体配色直接来自专业配色方案（瓦栏流行色系），且保证
-2 个深底 + 2 个浅底、色相差异明显，符合印刷实际。
+数码花型（hue_shift 模式，2026-10-11 新增）：
+调色板模式会把渐变压成色块（用户实测：数码花型看着像传统花型）。
+改为 HSV 色相旋转 + 明度调整 + 白场混合——完整保留渐变过渡与丰富色域，
+只改变整体色调，符合"数码印花不受套色限制"的本质。
 """
 
 import logging
@@ -111,21 +114,62 @@ def _recolor_with_palette(img: Image.Image, palette_hex: list, cluster_count: in
     return Image.fromarray(out, "RGB")
 
 
+# 数码花型色相偏移预设：2 深 + 2 浅，hue=色相旋转角度，value=明度系数，
+# sat=饱和度系数，whiten=向白混合比例（0-1，浅底用，保留渐变的"粉化"）
+HUE_SHIFT_PRESETS = [
+    {"name": "深调·青蓝转调", "hue": 150, "value": 0.68, "sat": 1.08, "whiten": 0.0},
+    {"name": "深调·暖棕转调", "hue": 30, "value": 0.80, "sat": 1.00, "whiten": 0.0},
+    {"name": "浅调·雾蓝粉化", "hue": 220, "value": 1.12, "sat": 0.92, "whiten": 0.16},
+    {"name": "浅调·晨光粉化", "hue": 300, "value": 1.22, "sat": 0.85, "whiten": 0.28},
+]
+
+
+def _hue_shift_variant(img: Image.Image, preset: dict) -> Image.Image:
+    """数码花型变体：HSV 色相旋转 + 明度/饱和度调整 + 可选白场混合。
+
+    与 palette 模式的本质区别：不做任何量化/映射，渐变像素关系原样保留，
+    只是整个色彩空间被旋转/调深浅 —— 输出仍是"无套色限制"的数码图。
+    """
+    hsv = np.array(img.convert("HSV"), dtype=np.float32)
+    h = (hsv[..., 0] + preset["hue"] / 360.0 * 255.0) % 256.0
+    s = np.clip(hsv[..., 1] * preset["sat"], 0, 255)
+    v = np.clip(hsv[..., 2] * preset["value"], 0, 255)
+    out = Image.fromarray(np.dstack([h, s, v]).astype(np.uint8), "HSV").convert("RGB")
+
+    whiten = preset.get("whiten", 0.0)
+    if whiten > 0:
+        arr = np.array(out, dtype=np.float32)
+        arr = arr * (1 - whiten) + 255.0 * whiten
+        out = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
+    return out
+
+
 def generate_color_variants(
     base_img: Image.Image,
     count: int = 4,
     dark_count: int = 2,
     palette_cfg: dict = None,
     cluster_count: int = 8,
+    mode: str = "palette",
 ) -> list:
     """
-    一花四色：从深/浅调色板池中取方案做专业重着色。
-    palette_cfg: {"dark": [{"name","colors":[hex...]}], "light": [...]}
+    一花四色。
+    mode="palette"   传统花型：调色板坡道重着色（按色制版观感）
+    mode="hue_shift" 数码花型：色相偏移重着色（保留渐变与丰富色域）
+    count>4 时预设循环取用。
     """
     if count <= 0:
         return []
-    palettes = _select_palettes(palette_cfg or {}, count, dark_count)
+
     variants = []
+    if mode == "hue_shift":
+        for i in range(count):
+            p = HUE_SHIFT_PRESETS[i % len(HUE_SHIFT_PRESETS)]
+            logger.info(f"    数码转调[{p['name']}]: hue+{p['hue']}° v={p['value']} whiten={p['whiten']}")
+            variants.append(_hue_shift_variant(base_img, p))
+        return variants
+
+    palettes = _select_palettes(palette_cfg or {}, count, dark_count)
     for p in palettes:
         logger.info(f"    配色方案[{p.get('name', '?')}]: {p['colors'][:3]}...")
         variants.append(_recolor_with_palette(base_img, p["colors"], cluster_count))

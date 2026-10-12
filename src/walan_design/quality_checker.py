@@ -67,12 +67,16 @@ def check_resolution(img_path: str, min_dpi: int = 200) -> tuple[bool, str]:
 
 def check_seamless(img_path: str, tolerance: int = 1) -> tuple[bool, str]:
     """
-    检查四方连续接回位质量（双信号，均自适应纹理活跃度）：
+    检查四方连续接回位质量（三信号，均自适应纹理活跃度）：
     1. 像素级：边缘像素差 vs 内部相邻行/列像素差基线
-       （offset 接回位边缘=原图内部相邻列，差异≈基线；mirror 精确相等）
+       （quilt/offset 接回位边缘=相位错位 Δ-1 px 的内容对，差异略高于基线；mirror 精确相等）
     2. 结构级：边缘行/列的均值差 vs 相邻行/列均值差基线
        （行均值对几千像素取平均，天然平滑——黑线/未接边会形成巨大离群值，
         高纹理图上像素级信号会被纹理噪声吸收，结构级信号不受影响）
+    3. 中央缝带：quilt/offset 的接缝在画面中央 ±宽/8 内
+       a) 硬切缝贯穿所有行/列 → 带内逐行最大相邻差的中位数 vs 周围同口径（2026-10-11 盲区修复：
+          本批 3 个失败作品边缘检查全过，缝在中央）
+       b) 糊带（旧 AI inpaint 失败产物）→ 带内梯度均值被压平 vs 周围
     """
     try:
         img = load_image(img_path)
@@ -102,6 +106,54 @@ def check_seamless(img_path: str, tolerance: int = 1) -> tuple[bool, str]:
             f"左右 像素差={h_pix:.1f}/{h_lim:.1f} 均值差={h_gap:.1f}/{h_mlim:.1f} | "
             f"上下 像素差={v_pix:.1f}/{v_lim:.1f} 均值差={v_gap:.1f}/{v_mlim:.1f}"
         )
+
+        # 中央缝带信号（小图跳过）
+        if w >= 256 and h >= 256:
+            int16 = arr.astype(np.int16)
+            seam_notes = []
+            # 竖缝贯穿所有行 → 逐行 max 的 median 抬升；横缝贯穿所有列 → 逐列 max
+            gc = np.abs(np.diff(int16, axis=1)).mean(axis=2)  # (h, w-1)
+            gr = np.abs(np.diff(int16, axis=0)).mean(axis=2)  # (h-1, w)
+            for vertical in (True, False):
+                g = gc if vertical else gr
+                n = g.shape[1] if vertical else g.shape[0]  # 带沿缝法线方向的定位基准
+                half_sz = (w if vertical else h) // 8       # 宽带：覆盖接缝寻径 wander 范围
+                narrow = min(w, h) // 32                    # 窄带：完全落在 heal 糊十字臂内（两臂等宽）
+                lo, hi = n // 2 - half_sz, n // 2 + half_sz
+                if lo <= 8:
+                    continue
+                if vertical:
+                    in_band = g[:, lo:hi]
+                    out_band = np.concatenate([g[:, 4:lo], g[:, hi : n - 4]], axis=1)
+                    med_in = float(np.median(in_band.max(axis=1)))   # 每行带内峰值
+                    med_out = float(np.median(out_band.max(axis=1)))
+                    # 糊带采样：in=中心窄带，out=外侧环带（旧 heal 糊带可达 ±600px，避开）
+                    nl, nh = n // 2 - narrow, n // 2 + narrow
+                    narrow_in = g[:, nl:nh]
+                    narrow_out = np.concatenate([g[:, n // 8 : n // 4], g[:, n - n // 4 : n - n // 8]], axis=1)
+                else:
+                    in_band = g[lo:hi, :]
+                    out_band = np.concatenate([g[4:lo, :], g[hi : n - 4, :]], axis=0)
+                    med_in = float(np.median(in_band.max(axis=0)))   # 每列带内峰值
+                    med_out = float(np.median(out_band.max(axis=0)))
+                    nl, nh = n // 2 - narrow, n // 2 + narrow
+                    narrow_in = g[nl:nh, :]
+                    narrow_out = np.concatenate([g[n // 8 : n // 4, :], g[n - n // 4 : n - n // 8, :]], axis=0)
+                ratio = med_in / (med_out + 1e-6)
+                mean_in = float(narrow_in.mean())
+                mean_out = float(narrow_out.mean())
+                blur = mean_in / (mean_out + 1e-6)
+                tag = "竖" if vertical else "横"
+                seam_notes.append(f"{tag}缝 峰比={ratio:.1f} 梯度比={blur:.2f}")
+                if med_out > 2.0 and ratio > 3.0:
+                    passed = False
+                    seam_notes.append(f"⨯ {tag}缝带出现贯穿性断裂线(峰比>{3.0})")
+                if mean_out > 0.5 and blur < 0.15:
+                    passed = False
+                    seam_notes.append(f"⨯ {tag}缝带纹理被抹平(糊带)")
+            if seam_notes:
+                detail += " | " + " ".join(seam_notes)
+
         return passed, detail
     except Exception as e:
         return False, f"接回位检测异常: {e}"

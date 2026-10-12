@@ -548,7 +548,7 @@ def preview(
         did = t
         local = resolve_local_design(did, runs_dir)
         if local:
-            note = f"变体 _{local['variant']}" if local.get("variant") else "全部变体"
+            note = f"上传变体 _{local['variant']}，展示全部 {len(local['pngs'])} 张" if local.get("variant") else f"全部 {len(local['pngs'])} 张"
             console.print(f"[dim]设计 {did} → 本地 {local['dir'].name}（{note}）[/dim]")
             sources = [(f"{local['dir'].name}_{p.stem.replace('design_', 'v')}", p) for p in local["pngs"]]
         else:

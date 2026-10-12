@@ -48,18 +48,23 @@ def generate_placeholder(brief: dict, config: dict) -> list[Image.Image]:
 
 
 def make_seamless(img: Image.Image) -> Image.Image:
-    """四方连续接回位：offset 四象限偏移 + 中央宽幅融合（默认）
+    """四方连续接回位（方法由 config psd.seamless_method 注入）
 
-    原理：把图按 4 象限重拼（左上↔右下互换），接缝从边缘移到画面中央。
-    外边缘变成原图内部 → 平铺天然无缝（左右边缘是原图相邻列，零差异）；
-    只需对中央十字缝做宽幅双向融合。两侧都是原图真实内容，交叉淡化
-    远比边缘镜像自然（镜像会产生人眼极敏感的对称痕迹，渐变图还会有
-    颜色挤压带）。
+    quilt（默认，2026-10-11 起）：相位错位 + 静区寻径拼接（seam_quilt，确定性算法）。
+      两片相位差 Δ px 的拼接对差异≈纹理基线，DP 寻径绕开细节走静区，
+      宽羽化兜底——零 AI、零 API 成本、确定可复现。替代"offset 硬切 + AI inpaint 修缝"
+      （inpaint 是彩票：2026-10-11 实测 3/3 失败——六角形被涂成纯棕十字、小碎花发糊）。
 
-    config: psd.seamless_method = "offset"（默认）| "mirror"（旧版边缘镜像）
+    offset（旧）：四象限重排 + 硬切窄羽化，中央缝交给 seam_healer（AI inpaint）修复。
+      接缝处内容级断裂仍可能出现，已不推荐。
+
+    mirror：边缘镜像融合（数学上无缝但有镜像对称痕迹）。
     """
-    # method 由调用方注入（避免读 config），全局变量由 set_seamless_method 设置
-    method = _SEAMLESS_METHOD[0] if _SEAMLESS_METHOD[0] else "offset"
+    method = _SEAMLESS_METHOD[0] if _SEAMLESS_METHOD[0] else "quilt"
+    if method == "quilt":
+        from walan_design.seam_quilt import quilt_offset
+
+        return quilt_offset(img, skip_px=_SEAMLESS_SKIP[0])
     if method == "mirror":
         return _make_seamless_mirror(img)
 
@@ -75,26 +80,18 @@ def make_seamless(img: Image.Image) -> Image.Image:
     result.paste(img.crop((hw, hh, w, h)), (0, 0))             # 右下 → 左上
     # 拼合缝位置：竖缝 x=w-hw，横缝 y=h-hh（奇数尺寸时偏离正中）
 
-    # ---- 中央十字宽幅双向融合 ----
+    # ---- 硬切 + 8px 窄羽化（无淡化带，无双影）----
     arr = np.array(result).astype(np.float32)
     sx, sy = w - hw, h - hh
-    blend = max(w // 8, 64)  # 比边缘法宽一倍：中央融合区可观察、可用大渐变
-    blend = min(blend, sx, sy, w - sx, h - sy)  # 防小图越界
-
-    # 垂直缝（x=sx）：缝两侧各 blend 宽度做线性交叉淡化
-    for x in range(blend):
-        # 距缝的距离 0..blend → alpha 从 0.5 到 0（缝上两侧各占一半）
-        a = 0.5 * (1 - x / blend)
-        L = arr[:, sx - 1 - x, :]   # 缝左侧
-        R = arr[:, sx + x, :]       # 缝右侧
+    feather = max(1, min(8, sx - 1, sy - 1, w - sx - 1, h - sy - 1))
+    for x in range(feather):
+        a = 0.5 * (1 - x / feather)
+        L, R = arr[:, sx - 1 - x, :], arr[:, sx + x, :]
         arr[:, sx - 1 - x, :] = L * (1 - a) + R * a
         arr[:, sx + x, :] = R * (1 - a) + L * a
-
-    # 水平缝（y=sy）：同理（在垂直融合后的 arr 上做，十字交汇处自然平滑）
-    for y in range(blend):
-        a = 0.5 * (1 - y / blend)
-        T = arr[sy - 1 - y, :, :]
-        B = arr[sy + y, :, :]
+    for y in range(feather):
+        a = 0.5 * (1 - y / feather)
+        T, B = arr[sy - 1 - y, :, :], arr[sy + y, :, :]
         arr[sy - 1 - y, :, :] = T * (1 - a) + B * a
         arr[sy + y, :, :] = B * (1 - a) + T * a
 
@@ -103,11 +100,16 @@ def make_seamless(img: Image.Image) -> Image.Image:
 
 # seamless_method 注入点（pipeline 里 set_seamless_method(config) 调用）
 _SEAMLESS_METHOD = [None]
+_SEAMLESS_SKIP = [6]
 
 
 def set_seamless_method(config: dict):
-    method = config.get("psd", {}).get("seamless_method", "offset")
-    _SEAMLESS_METHOD[0] = method if method in ("offset", "mirror") else "offset"
+    method = config.get("psd", {}).get("seamless_method", "quilt")
+    _SEAMLESS_METHOD[0] = method if method in ("quilt", "offset", "mirror") else "quilt"
+    try:
+        _SEAMLESS_SKIP[0] = max(2, int(config.get("psd", {}).get("seam_skip_px", 6)))
+    except (TypeError, ValueError):
+        _SEAMLESS_SKIP[0] = 6
 
 
 def _make_seamless_mirror(img: Image.Image) -> Image.Image:
@@ -286,6 +288,21 @@ def run(briefs: list, config: dict = None) -> list:
                 failures.append({"title": title, "reason": reason})
                 continue
 
+        # 1.5 周期窗口裁剪（机会性治本）：SDXL 偶尔画出准周期纹样，以周期 p 裁窗
+        #    可让 tile 天然严格平铺且母题完整；测不到周期就按整图走后续 quilt（fail-open）。
+        #    2026-10-11 实测：SDXL 输出多数无平移周期性（4 图校准 0 命中），此步是免费彩票。
+        if config["psd"].get("periodic_window", True):
+            try:
+                from walan_design.seam_quilt import find_periodic_tile
+
+                kept = []
+                for img in images:
+                    tile, _info = find_periodic_tile(img)
+                    kept.append(tile if tile is not None else img)
+                images = kept
+            except Exception as e:
+                logger.warning(f"  周期窗口搜索失败({e})，按整图继续")
+
         # 2. 超分辨率放大
         logger.info(f"  超分辨率放大 (method={upscale_method}, target_dpi={target_dpi})...")
         upscaled = []
@@ -308,21 +325,57 @@ def run(briefs: list, config: dict = None) -> list:
             except Exception as e:
                 logger.warning(f"  接回位处理失败: {e}")
 
-        # 4. 一花四色（专业调色板重着色）
+            # 3.5 SD inpaint 重绘接缝十字带（offset 硬切的内容级修复）。
+            # 只处理 upscaled[0]（基准图）——四色变体由基准图重着色派生，自动继承修复。
+            if (
+                _SEAMLESS_METHOD[0] == "offset"
+                and provider is not None
+                and config["psd"].get("seam_inpaint", True)
+                and upscaled
+            ):
+                from walan_design.seam_healer import heal_seams
+
+                band = int(config["psd"].get("seam_inpaint_band", 140))
+                # 主体描述（英文）供重绘 prompt 参考：帮助模型画出同主题的母题
+                subj = (brief.get("sd_prompt") or "").strip().rstrip(",")[:80]
+                logger.info(f"  SD inpaint 重绘接缝带 (band={band}px)...")
+                try:
+                    upscaled[0] = heal_seams(upscaled[0], provider, band_px=band, subject=subj)
+                except Exception as e:
+                    if is_hard_failure(str(e)):
+                        raise provider_blocked(engine, str(e)) from e
+                    logger.warning(f"  接缝重绘失败，保留硬切+羽化兜底: {e}")
+                    record_attention(
+                        config,
+                        f"接缝重绘:{title}",
+                        f"SD inpaint 接缝重绘失败（回退窄羽化，接缝处可能有细线）: {e}",
+                    )
+
+        # 4. 一花四色（按花型类型分路：传统=调色板坡道，数码=色相偏移保渐变）
         from walan_design.recolor import generate_color_variants
 
         color_count = design_cfg.get("color_variant_count", 4)
         dark_count = design_cfg.get("color_variant_mix", 2)
-        palette_cfg = design_cfg.get("recolor", {}).get("palettes")
+        recolor_cfg = design_cfg.get("recolor", {})
+        palette_cfg = recolor_cfg.get("palettes")
         base_image = upscaled[0] if upscaled else images[0]
-        logger.info(f"  生成一花四色变体: {color_count} 个（{dark_count}深底 + {color_count - dark_count}浅底）")
+        # 模式判定：config 显式指定优先，否则按 brief/全局类型的数码标记走 hue_shift
+        recolor_mode = recolor_cfg.get("mode", "auto")
+        if recolor_mode not in ("palette", "hue_shift"):
+            is_digital = (
+                (brief.get("floral_type") or "").lower() == "digital"
+                or design_cfg.get("brief_type", "mixed") == "digital"
+            )
+            recolor_mode = "hue_shift" if is_digital else "palette"
+        logger.info(f"  生成一花四色变体: {color_count} 个（模式={recolor_mode}）")
         try:
             color_variants = generate_color_variants(
                 base_image,
                 count=color_count,
                 dark_count=dark_count,
                 palette_cfg=palette_cfg,
-                cluster_count=int(design_cfg.get("recolor", {}).get("cluster_count", 8)),
+                cluster_count=int(recolor_cfg.get("cluster_count", 8)),
+                mode=recolor_mode,
             )
             all_images = upscaled + color_variants
         except Exception as e:

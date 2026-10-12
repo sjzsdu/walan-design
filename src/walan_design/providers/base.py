@@ -69,11 +69,13 @@ class ImageProvider:
         """工厂方法 — 根据名称创建供应商"""
         # 延迟导入避免循环依赖
         from .dalle import DalleProvider
+        from .diffusers_local import DiffusersLocalProvider
         from .sd_webui import SDWebUIProvider
         from .stability import StabilityProvider
 
         providers = {
             "stable_diffusion": SDWebUIProvider,
+            "diffusers_local": DiffusersLocalProvider,
             "stability": StabilityProvider,
             "dalle": DalleProvider,
         }

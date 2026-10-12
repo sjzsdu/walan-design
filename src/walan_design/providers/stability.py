@@ -226,6 +226,55 @@ class StabilityProvider(ImageProvider):
         except requests.exceptions.ConnectionError:
             raise RuntimeError("Stability API 连接失败")
 
+    def inpaint(self, image: Image.Image, mask: Image.Image, prompt: str, negative_prompt: str = "") -> Image.Image:
+        """
+        v2beta edit/inpaint：mask 白色像素=重绘，黑色=保留。返回同尺寸 RGB 图。
+        用于接缝重绘（seam_healer）：依据周围纹样填充 offset 切缝带。
+        """
+        endpoint = "https://api.stability.ai/v2beta/stable-image/edit/inpaint"
+        buf_img, buf_mask = io.BytesIO(), io.BytesIO()
+        image.convert("RGB").save(buf_img, "PNG")
+        mask.convert("L").save(buf_mask, "PNG")
+        buf_img.seek(0)
+        buf_mask.seek(0)
+
+        logger.info(f"  Stability inpaint: {prompt[:60]}...")
+        try:
+            resp = requests.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {self.api_key}", "Accept": "image/*"},
+                files={
+                    "image": ("image.png", buf_img, "image/png"),
+                    "mask": ("mask.png", buf_mask, "image/png"),
+                },
+                data={
+                    "prompt": prompt,
+                    "negative_prompt": negative_prompt,
+                    "output_format": "png",
+                },
+                timeout=180,
+            )
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError("Stability API 连接失败")
+
+        if resp.status_code != 200:
+            try:
+                err = resp.json()
+                errors = err.get("errors")
+                msg = str(errors[0] if isinstance(errors, list) and errors else err.get("message", ""))[:200]
+            except Exception:
+                msg = resp.text[:200]
+            raise RuntimeError(_classify_http_error(resp.status_code, msg))
+
+        content_type = resp.headers.get("content-type", "")
+        if "image" not in content_type:
+            raise RuntimeError(f"Stability inpaint 返回异常 content-type: {content_type}")
+        out = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        if out.size != image.size:
+            out = out.resize(image.size, Image.LANCZOS)
+        logger.info(f"  Stability inpaint 完成: {out.size}")
+        return out
+
     def _generate_sdxl_v1(self, params: GenerationParams, prompt_text: str) -> GenerationResult:
         """SDXL 1.0 legacy v1 API：JSON 请求，base64 返回，支持 tile-texture 预设"""
         import base64

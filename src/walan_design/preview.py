@@ -124,11 +124,8 @@ def resolve_local_design(design_id: str, runs_dir: str) -> dict:
                     variant = m.group(1)
             except Exception:
                 pass
-        if variant:
-            pngs = [d / f"design_{variant}.png"]
-            pngs = [p for p in pngs if p.exists()] or sorted(d.glob("design_*.png"))
-        else:
-            pngs = sorted(d.glob("design_*.png"))
+        # 设计号只用于定位 run 目录：预览始终展示全部变体（与无参数 preview 行为一致）
+        pngs = sorted(d.glob("design_*.png"))
         if not pngs:
             pngs = sorted(d.glob("*.png"))
         if pngs:

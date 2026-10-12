@@ -82,12 +82,13 @@ design:
   # 花型类型偏向：traditional（传统花型，颜色离散、按色制版） /
   #   digital（数码花型，渐变丰富、全彩不受限） /
   #   mixed（混合，让 LLM 根据趋势图自选，推荐）
-  brief_type: "mixed"
+  brief_type: "digital"
   # 供应商选择：stability / dalle / stable_diffusion
   # stability: 云端 SDXL API（推荐，质量高，~$0.03/张）
   # dalle: OpenAI DALL-E 3（接入简单，~$0.04-0.12/张）
-  # stable_diffusion: 本地 SD WebUI（免费但需 GPU）
-  engine: "stability"
+  # diffusers_local: 本地 diffusers + circular padding（UNet+VAE，生成即四方连续）
+  # stable_diffusion: 旧 A1111 WebUI 路径（2026 已废，stablediffusion 仓库被删）
+  engine: "diffusers_local"
   output_dir: "output/designs"
 
   # 各供应商配置
@@ -100,10 +101,16 @@ design:
     model: "dall-e-3"
 
   stable_diffusion:
-    api_url: "http://127.0.0.1:7860"
-    checkpoint: "v1-5-pruned-emaonly.safetensors"
-    use_controlnet: true
+    api_url: "http://127.0.0.1:7861"
+    # SDXL base 1.0（本地 WebUI models/Stable-diffusion/ 下）
+    checkpoint: "sd_xl_base_1.0.safetensors"
+    # 平铺模式：native = circular padding（UNet+VAE，生成即四方连续，推荐）
+    #          controlnet = 旧 ControlNet tile 方案（仅 SD1.5）
+    tiling_mode: "native"
+    use_controlnet: false
     controlnet_model: "control_v11p_sd15_tile"
+    # Mac M2 MPS 跑 SDXL 1024×1536 30步约 26 分钟，超时放宽到 40 分钟
+    timeout_s: 2400
     width: 1024
     height: 1536   # 2:3 比例
     steps: 30
@@ -144,7 +151,13 @@ design:
 
   # --- 一花四色专业调色板 ---
   recolor:
-    cluster_count: 8   # 主色聚类数
+    cluster_count: 8   # 主色聚类数（仅 palette 模式用）
+    # 重着色模式:
+    #   auto      = 按花型类型自动分路（推荐）：数码→hue_shift（色相偏移，保留渐变与丰富色域），
+    #               传统→palette（调色板坡道，按色制版观感）
+    #   palette   = 强制调色板模式（传统花型）
+    #   hue_shift = 强制色相偏移模式（数码花型）
+    mode: "auto"
     # palettes 留空则用内置方案（深底：墨蓝金/酒红夜曲/松林暮色；浅底：奶油乡村/雾霾粉彩/薄荷清晨）
     # 自定义示例：
     # palettes:
@@ -211,10 +224,25 @@ psd:
   # 天然有 ~1-3 灰阶差异（视觉不可见）；mirror 法可设 0（精确相等）
   seamless_tolerance: 3
   # 接回位算法:
-  #   offset = 四象限偏移 + 中央宽幅融合（默认，推荐）
-  #            接缝移到画面中央处理，外边缘平铺天然无缝，无镜像对称痕迹
+  #   quilt  = 相位错位 + 静区寻径拼接（默认，推荐，确定性算法零 AI）
+  #            缝两侧内容只差 Δ px 相位，DP 寻径绕开细节走静区 + 宽羽化兜底；
+  #            无切花断裂、无双影、确定可复现、零 API 成本
+  #   offset = 四象限偏移 + 硬切窄羽化（旧）
+  #            接缝移到画面中央，外边缘平铺天然无缝；
+  #            切缝断裂需 seam_inpaint 的 SD 重绘修复（inpaint 是彩票，已弃用）
   #   mirror = 旧版边缘镜像融合（渐变图会有颜色挤压带、大母题有对称痕迹）
-  seamless_method: "offset"
+  seamless_method: "quilt"
+  # quilt 相位错位基准量 px：候选 Δ 在其 ±4 内自适应选取（拼接差异最小者）。
+  # 越小缝越不可见，但过小（<2）拼接对差异反而变大；几何图案可试 4-6
+  seam_skip_px: 6
+  # SD inpaint 接缝重绘（仅 offset 方法生效）：把切缝十字带交给 Stability inpaint 重绘。
+  # 2026-10-11 实测 3/3 失败（六角形被涂成纯棕十字、小碎花发糊），已默认关闭
+  seam_inpaint: false
+  # 重绘十字带半宽（全分辨率 px）：越大重绘范围越宽，默认 140（约占宽度 3%）
+  seam_inpaint_band: 140
+  # 周期窗口搜索（机会性）：生图后若检测到准周期性（残差比<2），裁出周期窗口作为 tile，
+  # 母题天然完整可平铺；SDXL 多数输出无周期性，此步多数时候不命中（免费彩票，fail-open）
+  periodic_window: true
   # 压缩策略（实测 4724×7087×2 层 PSD）:
   #   raw:            351 MB (无压缩，现用路径)
   #   rle:            113 MB (默认)
