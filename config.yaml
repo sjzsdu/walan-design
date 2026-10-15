@@ -54,13 +54,17 @@ trend:
       keywords: "trending patterns"
       max_items: 20
   llm:
-    provider: "openrouter"
-    model: "openrouter/auto"   # 自动选最便宜可用模型，或指定 "anthropic/claude-3.5-sonnet" / "openai/gpt-4o-mini"
-    base_url: "https://openrouter.ai/api/v1"
-    api_key: ""   # 留空则从环境变量 OPENROUTER_API_KEY 读取
-  # 视觉 LLM（分析真实趋势图 / 免费视觉模型；备选 "openrouter/free"）
+    provider: "dashscope"
+    model: "qwen-plus"   # 文本生成模型：qwen-plus（推荐）/ qwen-turbo（更快更便宜）/ qwen-max（更强但贵）
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key: ""   # 留空则从环境变量 DASHSCOPE_API_KEY 读取
+  # 视觉 LLM（分析真实趋势图 / 多模态）
+  # 当前 key 可用：qwen-vl-ocr（OCR 模型，非通用视觉）
+  # 如需通用视觉（花型审美分析）：在百炼控制台开通 qwen-vl-max-latest 权限
   vision:
-    model: "dots-studio/dots-3-note-preview:free"
+    # 独立于文本 LLM：DashScope key 仅开 OCR 权限，视觉分析走 SiliconFlow 多模态模型
+    model: "Qwen/Qwen3-VL-8B-Instruct"
+    base_url: "https://api.siliconflow.cn/v1"
     max_images: 8    # 每次分析附给模型的真实趋势图数量
   # ego-browser 采集参数
   browser:
@@ -83,12 +87,13 @@ design:
   #   digital（数码花型，渐变丰富、全彩不受限） /
   #   mixed（混合，让 LLM 根据趋势图自选，推荐）
   brief_type: "digital"
-  # 供应商选择：stability / dalle / stable_diffusion
-  # stability: 云端 SDXL API（推荐，质量高，~$0.03/张）
-  # dalle: OpenAI DALL-E 3（接入简单，~$0.04-0.12/张）
-  # diffusers_local: 本地 diffusers + circular padding（UNet+VAE，生成即四方连续）
-  # stable_diffusion: 旧 A1111 WebUI 路径（2026 已废，stablediffusion 仓库被删）
-  engine: "diffusers_local"
+  # 供应商选择：siliconflow / diffusers_local / stability / dalle
+  # siliconflow: 硅基流动云端（主力，Z-Image-Turbo ¥0.036/张 2 秒出图，零运维；
+  #              四方连续靠 quilt 后处理——已验证路线，5 个上架作品即此方案）
+  # diffusers_local: 本地 SDXL + circular padding（后备，26 分钟/张，需启动 diffusers_server.py）
+  # stability: Stability 官方 API（key 已空，弃用）
+  # dalle: OpenAI DALL-E 3（~$0.04-0.12/张，贵）
+  engine: "siliconflow"
   output_dir: "output/designs"
 
   # 各供应商配置
@@ -102,8 +107,20 @@ design:
 
   stable_diffusion:
     api_url: "http://127.0.0.1:7861"
-    # SDXL base 1.0（本地 WebUI models/Stable-diffusion/ 下）
+    # server 端模型注册表 key：juggernaut=Juggernaut XL v9 美学精调（推荐）/ base=SDXL base 1.0
+    # 2026-10-12 提质量换装：SDXL base 是精调底座，审美平庸（拼贴碎片/撞色），
+    # Juggernaut XL v9 在同 prompt 下审美明显更好且兼容 circular padding
+    model_key: "juggernaut"
+    # 旧字段保留供 server 注册表参考
     checkpoint: "sd_xl_base_1.0.safetensors"
+
+    # 硅基流动云端（engine=siliconflow 时使用）
+    siliconflow:
+      api_url: "https://api.siliconflow.cn/v1/images/generations"
+      user_info_url: "https://api.siliconflow.cn/v1/user/info"
+      # Z-Image-Turbo: ¥0.036/张 2秒（跑量主力）；Qwen-Image: 质量更高（备选精品档）
+      model: "Tongyi-MAI/Z-Image-Turbo"
+      api_key: ""  # 留空读 SILICONFLOW_API_KEY 环境变量
     # 平铺模式：native = circular padding（UNet+VAE，生成即四方连续，推荐）
     #          controlnet = 旧 ControlNet tile 方案（仅 SD1.5）
     tiling_mode: "native"
@@ -143,10 +160,11 @@ design:
   # --- AI 视觉自评闭环（生图后打分，低分带建议重生成）---
   visual_review:
     enabled: true
-    model: "dots-studio/dots-3-note-preview:free"   # OpenRouter 免费视觉模型（实测最稳）；备选 "openrouter/free"
-    base_url: "https://openrouter.ai/api/v1"
-    api_key: ""        # 留空读 OPENROUTER_API_KEY
-    threshold: 70      # 低于该分触发重生成（0-100）
+    # Qwen3-Omni-30B (硅基流动)：多模态审美评分，走 SiliconFlow key 不依赖 OpenRouter 免费档限流
+    model: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+    base_url: "https://api.siliconflow.cn/v1"
+    api_key: ""        # 留空读 SILICONFLOW_API_KEY
+    threshold: 70      # 低于该分触发重生成（0-100）；重试后仍不及格 → 拦截，不进 PSD/上传
     max_retries: 2     # 最多重生成次数
 
   # --- 一花四色专业调色板 ---
@@ -291,4 +309,4 @@ pipeline:
   # 花型集中目录：每个花型一个子目录，存放 PNG/PSD/brief/upload 等全部产物
   runs_dir: "output/runs"
   # 上传任务准备好后自动用 ego-browser 真实上传到瓦栏（false=只准备任务等手动执行）
-  auto_upload: true
+  auto_upload: true  # run 全自动：生成→PSD→质检→上传→发布公开区

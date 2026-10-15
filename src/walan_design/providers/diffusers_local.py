@@ -31,7 +31,11 @@ class DiffusersLocalProvider(ImageProvider):
         sd_cfg = config.get("stable_diffusion", {})
         self.server_url = sd_cfg.get("api_url", API_URL)
         self.timeout = int(sd_cfg.get("timeout_s", 1800))
-        logger.info(f"diffusers_local provider: server={self.server_url}, timeout={self.timeout}s")
+        # server 端模型注册表 key（juggernaut=美学精调 / base=SDXL 原始底座）
+        self.model_key = sd_cfg.get("model_key", "juggernaut")
+        logger.info(
+            f"diffusers_local provider: server={self.server_url}, model={self.model_key}, timeout={self.timeout}s"
+        )
 
     def health_check(self) -> bool:
         try:
@@ -49,6 +53,7 @@ class DiffusersLocalProvider(ImageProvider):
             "steps": params.steps,
             "cfg_scale": params.cfg_scale,
             "seed": params.seed,
+            "model": self.model_key,
         }
         logger.info(f"  diffusers_local: {params.prompt[:60]}... ({params.width}×{params.height})")
         try:

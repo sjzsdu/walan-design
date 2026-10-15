@@ -407,9 +407,29 @@ def execute_upload(task: dict, config: dict, timeout: int = 600) -> dict:
 
             logger.info(f"  {title}: 文件已提交，等待服务器处理...")
             # 上传完成后跳转到新上传列表页（designs/new/...?msg=...已上传）
-            page.wait_for_url("**/designs/new/**", timeout=360000)
-            page.wait_for_timeout(2500)
-            logger.info(f"  {title}: 服务器校验通过，已进入新上传列表")
+            try:
+                page.wait_for_url("**/designs/new/**", timeout=360000)
+                page.wait_for_timeout(2500)
+                logger.info(f"  {title}: 服务器校验通过，已进入新上传列表")
+            except Exception as e:
+                logger.warning(f"  {title}: 等待 URL 跳转超时（{e}），服务器可能仍在处理，尝试继续...")
+                # 瓦栏服务器慢时 URL 可能 10+ 分钟才跳 —— 但 upload 实际已成功，
+                # 直接轮询 designs/new 列表页，找到刚上传的卡片即算成功
+                try:
+                    page.goto(
+                        "https://www.walanwalan.com/console/designs/new/page1/",
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    page.wait_for_timeout(2500)
+                    if "login" in page.url.lower():
+                        raise RuntimeError("登录已失效")
+                    # 第一张卡片就是刚上传的
+                    page.wait_for_selector(".imggrid", timeout=15000)
+                    logger.info(f"  {title}: 轮询到新上传列表，继续管理步骤")
+                except Exception as poll_err:
+                    logger.error(f"  {title}: URL 超时 + 轮询也失败: {poll_err}")
+                    raise  # 真正失败才 raise
         # 点第一张卡片（刚上传的设计），管理表单同页展开
         page.wait_for_selector(".imggrid", timeout=30000)
         page.click(".imggrid")

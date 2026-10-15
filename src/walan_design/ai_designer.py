@@ -64,7 +64,11 @@ def make_seamless(img: Image.Image) -> Image.Image:
     if method == "quilt":
         from walan_design.seam_quilt import quilt_offset
 
-        return quilt_offset(img, skip_px=_SEAMLESS_SKIP[0])
+        # Δ（skip_px）按 1024 宽设计；放大到 4724 宽后仍用 6px ≈ 无错位，
+        # 拼接对逐像素相同（差 0.8 vs 图内基线 24）→ 接缝纹理节奏断裂，
+        # 人眼判定"上下没接好"（2026-10-12 羽叶轻吟 preview 复盘）。按图宽等比放大。
+        skip = max(_SEAMLESS_SKIP[0], img.width * _SEAMLESS_SKIP[0] // 1024)
+        return quilt_offset(img, skip_px=skip)
     if method == "mirror":
         return _make_seamless_mirror(img)
 
@@ -268,14 +272,19 @@ def run(briefs: list, config: dict = None) -> list:
         images, critiques = [], []
         gen_err = ""
         if provider is not None:
-            try:
-                images, critiques = _generate_with_review(provider, brief, config, sd_cfg, common)
-            except Exception as e:
-                gen_err = f"{type(e).__name__}: {e}"
-                if is_hard_failure(str(e)):
-                    # 余额耗尽/key 失效/网络断：后续每个设计都会同样失败，立即中止
-                    raise provider_blocked(engine, str(e)) from e
-                logger.error(f"  供应商生成失败: {e}")
+            # 生成前快速健康检查（5s 超时）——服务挂了就不要傻等 2400s
+            if not provider.health_check():
+                gen_err = f"供应商 {provider.name} 健康检查未通过（服务可能已挂）"
+                logger.error(f"  {gen_err}")
+            else:
+                try:
+                    images, critiques = _generate_with_review(provider, brief, config, sd_cfg, common)
+                except Exception as e:
+                    gen_err = f"{type(e).__name__}: {e}"
+                    if is_hard_failure(str(e)):
+                        # 余额耗尽/key 失效/网络断：后续每个设计都会同样失败，立即中止
+                        raise provider_blocked(engine, str(e)) from e
+                    logger.error(f"  供应商生成失败: {e}")
 
         if not images:
             if allow_placeholder:
@@ -287,6 +296,18 @@ def run(briefs: list, config: dict = None) -> list:
                 record_attention(config, f"生图:{title}", reason)
                 failures.append({"title": title, "reason": reason})
                 continue
+
+        # 1.1 视觉自评拦截：不及格的设计不进 PSD/上传。
+        #     2026-10-12 事故：热带花卉 59 分（评审自己都给了 "less primary contrast" 建议）
+        #     却照常发布上架。评审只是"重试不拦截"等于没有评审。
+        vrev_enabled = config["design"].get("visual_review", {}).get("enabled", False)
+        if vrev_enabled and critiques and not critiques[-1].get("passed", True):
+            score = critiques[-1].get("overall", 0)
+            reason = f"视觉自评不及格（{score:.0f} 分，低于阈值），已拦截，不进入 PSD/上传"
+            logger.error(f"  {reason}")
+            record_attention(config, f"生图:{title}", reason)
+            failures.append({"title": title, "reason": reason})
+            continue
 
         # 1.5 周期窗口裁剪（机会性治本）：SDXL 偶尔画出准周期纹样，以周期 p 裁窗
         #    可让 tile 天然严格平铺且母题完整；测不到周期就按整图走后续 quilt（fail-open）。
@@ -303,7 +324,11 @@ def run(briefs: list, config: dict = None) -> list:
             except Exception as e:
                 logger.warning(f"  周期窗口搜索失败({e})，按整图继续")
 
-        # 2. 超分辨率放大
+        # 2. 超分辨率放大（放大前先裁白框——Z-Image 直出图自带白边框，
+        # 会污染 quilt 指标且平铺每格露白缝）
+        from walan_design.seam_quilt import trim_white_border
+
+        images = [trim_white_border(img) for img in images]
         logger.info(f"  超分辨率放大 (method={upscale_method}, target_dpi={target_dpi})...")
         upscaled = []
         for img in images:

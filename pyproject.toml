@@ -1,6 +1,6 @@
 [project]
 name = "walan-design"
-version = "0.1.0"
+version = "0.1.1"
 description = "AI 花型设计自动售卖流水线 — 从趋势采集到瓦栏上传全自动化"
 requires-python = ">=3.11"
 dependencies = [

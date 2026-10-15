@@ -25,9 +25,11 @@ DEFAULT_COMPOSITION = (
 DEFAULT_MEDIUM = "flat textile print for fabric industry, matte finish, no perspective, no shadows"
 
 # 数码花型专用：强调无套色限制的渐变与丰富色域（2026-10-11，用户反馈数码花型看着像传统花型）
+# 2026-10-12 补和谐约束：SDXL base 直出易高饱和撞色（热带花卉事故——红绿蓝纯色硬块）
 DEFAULT_DIGITAL_MEDIUM = (
     "digital textile print, unlimited color palette, rich smooth color gradients, "
-    "watercolor color blends, layered vibrant tones, painterly depth"
+    "watercolor color blends, layered vibrant tones, painterly depth, "
+    "harmonious coordinated color palette, gentle color contrast, unified mood"
 )
 # 数码花型的构图约束：去掉 flat illustration style（扁平风会压掉渐变表现力）
 DEFAULT_DIGITAL_COMPOSITION = (

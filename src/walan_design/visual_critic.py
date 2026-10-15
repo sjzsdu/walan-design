@@ -23,7 +23,11 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "dots-studio/dots-3-note-preview:free"
+# 2026-10-12 事故复盘：qwen-vl-ocr 是 OCR 模型无审美判断力（拼贴碎片图打 86 分放行）；
+# DashScope key 又仅开通 OCR 模型权限。改用 OpenRouter 免费 nemotron-omni（实测对已知烂图
+# 准确打出 40 分：composition 40/color 30，审美靠谱）。gemma-4 免费档持续 429 不可用。
+DEFAULT_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
 CRITIC_SYSTEM_PROMPT = """You are a strict art director at a textile design studio \
 reviewing AI-generated fabric patterns for a marketplace (Walalnwalan, Chinese textile platform).
@@ -53,7 +57,19 @@ def _vision_config(config: dict) -> dict:
 
 def _get_api_key(config: dict) -> str:
     cfg = _vision_config(config)
-    return cfg.get("api_key") or os.environ.get("OPENROUTER_API_KEY", "")
+    # base_url 包含 siliconflow 时优先读 SILICONFLOW_API_KEY，其次 OPENROUTER/DASHSCOPE
+    base_url = cfg.get("base_url", "")
+    if "siliconflow" in base_url.lower():
+        return (
+            cfg.get("api_key")
+            or os.environ.get("SILICONFLOW_API_KEY", "")
+            or os.environ.get("OPENROUTER_API_KEY", "")
+        )
+    return (
+        cfg.get("api_key")
+        or os.environ.get("OPENROUTER_API_KEY", "")
+        or os.environ.get("DASHSCOPE_API_KEY", "")
+    )
 
 
 def _encode_image(image: Image.Image, max_side: int = 768) -> str:
@@ -164,7 +180,7 @@ def critique_image(image: Image.Image, brief: dict, config: dict) -> dict:
 
         client = OpenAI(
             api_key=api_key,
-            base_url=vcfg.get("base_url", "https://openrouter.ai/api/v1"),
+            base_url=vcfg.get("base_url", DEFAULT_BASE_URL),
         )
         b64 = _encode_image(image)
         theme = brief.get("theme", "") or brief.get("sd_prompt", "")[:120]

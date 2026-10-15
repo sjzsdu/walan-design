@@ -27,6 +27,42 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
+def trim_white_border(img: Image.Image, thresh: float = 248) -> Image.Image:
+    """裁掉直出图四周的白色画布边框。
+    Z-Image 等模型会把 seamless pattern 画成带白框的"设计稿"，白框污染 quilt
+    接缝指标（白vs白=差0）且平铺每格露白缝（2026-10-12 羽叶轻吟复盘）。
+
+    判断逻辑（两层保险，避免误裁浅米白设计）：
+      1. 行/列均值 > thresh（默认 248 = 纯白画布纸色）
+      2. 该行/列 >248 的像素占比 > 90%（设计边缘的浅米白<248，不会被误裁）
+    同时满足才认定为画布边框。最多裁到 h/3 或 w/3 位置，防止误伤半张图。
+
+    2026-10-13 潮流格纹水彩复盘：trim 在 1024×1536 直出图上裁 50px，
+    放大到 4724×7087 后变成 213px 白框——裁剪位置必须在放大前（设计层）。
+    """
+    arr = np.asarray(img.convert("L"))
+    h, w = arr.shape
+
+    def _count_edge(iter_rows):
+        cnt = 0
+        for row in iter_rows:
+            if row.mean() > thresh and (row > thresh).mean() > 0.9:
+                cnt += 1
+            else:
+                break
+        return cnt
+
+    top = _count_edge(arr[: h // 3])
+    bot = _count_edge(arr[-1 : 2 * h // 3 - 1 : -1])
+    left = _count_edge(arr[:, : w // 3].T)
+    right = _count_edge(arr[:, -1 : 2 * w // 3 - 1 : -1].T)
+
+    if top == 0 and bot == 0 and left == 0 and right == 0:
+        return img
+    logger.info(f"  裁除白框: 上{top}px 下{bot}px 左{left}px 右{right}px")
+    return img.crop((left, top, w - right, h - bot))
+
+
 def _min_path(cost: np.ndarray) -> np.ndarray:
     """DP 最小路径：cost (H, W)，路径每步可走 i-1/i/i+1，返回每行选的状态 idx (H,)"""
     h, w = cost.shape
@@ -54,14 +90,14 @@ def _min_path(cost: np.ndarray) -> np.ndarray:
     return path
 
 
-def _plan_axis(a: np.ndarray, skip_px: int, window: int) -> tuple:
+def _plan_axis(a: np.ndarray, skip_px: int, window: int, t0: int = None) -> tuple:
     """
     为一条轴做寻径规划：试多个相位候选 Δ，选拼接差异最小的。
     返回 (delta, 每行/列边界 t, join_diff)。
     """
     h, w, _ = a.shape
     K = max(24, min(window, w // 4))
-    t0 = w // 2
+    t0 = w // 2 if t0 is None else t0
     rows = np.arange(h)
     d_max = max(2, w // 64)
     deltas = sorted({d for d in (skip_px - 4, skip_px - 2, skip_px, skip_px + 2, skip_px + 4) if 2 <= d <= d_max})
@@ -92,7 +128,16 @@ def _quilt_axis(arr: np.ndarray, skip_px: int, window: int, axis: int) -> tuple:
     if axis == 0:
         arr = arr.transpose(1, 0, 2)  # 转成统一按"竖缝"处理，最后转回
     h, w, _ = arr.shape
-    delta, t, join_diff = _plan_axis(arr, skip_px, window)
+
+    # 预 roll：原 wrap 缝（首列|尾列硬拼）先转移到 DP 最优静区——转移后 wrap 对
+    # 变成"相隔 1px 的自然相邻"，原硬缝则落在图内固定区域，交给下方两片 DP 拼接吃掉。
+    # （2026-10-12 羽叶轻吟复盘：只 DP 中间缝、硬吃 wrap 缝 → wrap 差 2.2×基线，平铺可见缝）
+    grad = np.abs(arr[:, :-1].astype(np.int16) - arr[:, 1:].astype(np.int16)).mean(axis=2)
+    cut = _min_path(grad)  # 每行最优切割列（走最平滑静区）
+    arr = np.stack([np.concatenate([row[r:], row[:r]], axis=0) for row, r in zip(arr, cut)])
+    hard_t0 = int(np.clip(w - int(np.median(cut)), w // 4, 3 * w // 4))  # 原硬缝的新位置
+
+    delta, t, join_diff = _plan_axis(arr, skip_px, window, t0=hard_t0)
     t = t.astype(np.int32)
 
     # 组装：x < t(y) 取左片 A[y, x]；x >= t(y) 取右片 A[y, (x+delta)%w]
@@ -127,6 +172,26 @@ def quilt_offset(img: Image.Image, skip_px: int = 6, window: int = 200) -> Image
     logger.info(f"  竖缝寻径拼接差异 {join_v:.1f}（相位错位 {skip_px}px，确定性算法，无 AI）")
     arr, join_h = _quilt_axis(arr, skip_px, window, axis=0)
     logger.info(f"  横缝寻径拼接差异 {join_h:.1f}")
+
+    # wrap 兜底：两轮寻径后 wrap 对仍可能被次级效应抬高（2026-10-12 热带花卉复盘：
+    # 竖缝后 2.1，横缝后恶化至基线数倍）。超阈值时对首尾边缘做局部镜像混合压平——
+    # 确定性、无 AI，只作用在 wrap 静区（DP 已把最平滑处转到 wrap）。
+    for ax in (1, 0):
+        a = arr if ax == 1 else arr.transpose(1, 0, 2)
+        h, w = a.shape[:2]
+        edge = float(np.abs(a[:, 0].astype(np.int16) - a[:, w - 1].astype(np.int16)).mean())
+        cs = np.linspace(0, w - 2, 256, dtype=int)
+        base = float(np.abs(a[:, cs].astype(np.int16) - a[:, cs + 1].astype(np.int16)).mean())
+        if edge <= 1.2 * base + 2:
+            continue
+        blend = max(16, min(48, w // 64))
+        flip = a[:, w - blend:, :][:, ::-1, :]
+        for x in range(blend):
+            alpha = 1 - x / blend
+            a[:, x, :] = (a[:, x, :] * (1 - alpha) + flip[:, x, :] * alpha).astype(a.dtype)
+        if ax == 0:
+            arr = a.transpose(1, 0, 2)
+        logger.info(f"  wrap 兜底混合 {blend}px（边缘差 {edge:.1f} > 基线 {base:.1f}）")
     return Image.fromarray(arr)
 
 

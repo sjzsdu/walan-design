@@ -71,11 +71,13 @@ class ImageProvider:
         from .dalle import DalleProvider
         from .diffusers_local import DiffusersLocalProvider
         from .sd_webui import SDWebUIProvider
+        from .siliconflow import SiliconFlowProvider
         from .stability import StabilityProvider
 
         providers = {
             "stable_diffusion": SDWebUIProvider,
             "diffusers_local": DiffusersLocalProvider,
+            "siliconflow": SiliconFlowProvider,
             "stability": StabilityProvider,
             "dalle": DalleProvider,
         }

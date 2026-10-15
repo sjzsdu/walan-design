@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from walan_design import __version__
 from walan_design.pipeline import (
     load_config,
     run_collect,
@@ -265,7 +266,7 @@ def run(
 
     console.print(
         Panel.fit(
-            f"[bold cyan]walan-design v0.1.0[/bold cyan]\n"
+            f"[bold cyan]walan-design v{__version__}[/bold cyan]\n"
             f"模式: [bold]{mode}[/bold]  |  批量: [bold]{config['trend']['brief_count']}[/bold]  |  类型: [bold]{type_label}[/bold]",
             border_style="green",
         )
@@ -355,7 +356,10 @@ def design(
     if input_file:
         with open(input_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-        briefs = data.get("briefs", data)
+        briefs = data.get("briefs", data) if isinstance(data, dict) else data
+        # 单个 brief dict（如 runs/<标题>/brief.json）→ 包成列表
+        if isinstance(briefs, dict):
+            briefs = [briefs]
     else:
         briefs = _local_fallback_briefs(config["trend"]["brief_count"], config["design"]["style_preferences"])
 
@@ -495,6 +499,38 @@ def upload(
 # =====================================================
 
 
+def _fetch_design_title(design_id: str, state_path: str) -> str:
+    """从瓦栏控制台页面提取设计号对应的标题（如 "1680586-热带花卉_1" 提取出 "热带花卉_1"）"""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(storage_state=state_path)
+        page = ctx.new_page()
+        try:
+            page.goto(
+                "https://www.walanwalan.com/console/designs/all/page1/",
+                wait_until="domcontentloaded",
+                timeout=20000,
+            )
+            page.wait_for_timeout(2000)
+            title = page.evaluate(
+                """(did) => {
+                    const cards = [...document.querySelectorAll('[class*="imggrid_holder_"]')];
+                    for (const c of cards) {
+                        const text = (c.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean);
+                        const hit = text.find(l => l.startsWith(did + '-'));
+                        if (hit) return hit.slice(did.length + 1);
+                    }
+                    return '';
+                }""",
+                design_id,
+            )
+            return title or ""
+        finally:
+            browser.close()
+
+
 @app.command()
 def preview(
     target: str = typer.Argument(None, help="PNG 路径 / 花型目录 / 瓦栏设计号（留空=最近生成的花型目录）"),
@@ -546,7 +582,14 @@ def preview(
         sources = [(f"{target_dir.name}_{p.stem.replace('design_', 'v')}", p) for p in pngs]
     elif t.isdigit():
         did = t
-        local = resolve_local_design(did, runs_dir)
+        # 先尝试远程抓标题，再用标题兜底本地匹配
+        walan_title = ""
+        try:
+            from walan_design.upload_executor import STATE_FILE
+            walan_title = _fetch_design_title(did, STATE_FILE)
+        except Exception:
+            pass
+        local = resolve_local_design(did, runs_dir, walan_title=walan_title)
         if local:
             note = f"上传变体 _{local['variant']}，展示全部 {len(local['pngs'])} 张" if local.get("variant") else f"全部 {len(local['pngs'])} 张"
             console.print(f"[dim]设计 {did} → 本地 {local['dir'].name}（{note}）[/dim]")
@@ -572,8 +615,30 @@ def preview(
         elif p.exists():
             sources = [(p.stem, p)]
         else:
-            console.print(f"[red]路径不存在: {p}[/red]")
-            raise typer.Exit(code=1)
+            # 不是路径也不是数字 → 当作设计标题，去 runs_dir 里找同名目录
+            runs = Path(runs_dir)
+            matched = None
+            if runs.exists():
+                # 精确匹配优先，再模糊包含
+                for d in runs.iterdir():
+                    if d.is_dir() and d.name == t:
+                        matched = d
+                        break
+                if matched is None:
+                    for d in runs.iterdir():
+                        if d.is_dir() and t in d.name:
+                            matched = d
+                            break
+            if matched:
+                pngs = sorted(matched.glob("design_*.png")) or sorted(matched.glob("*.png"))
+                if not pngs:
+                    console.print(f"[red]{matched} 下没有 PNG 文件[/red]")
+                    raise typer.Exit(code=1)
+                console.print(f"[dim]标题 '{t}' → {matched}（{len(pngs)} 张）[/dim]")
+                sources = [(f"{matched.name}_{q.stem.replace('design_', 'v')}", q) for q in pngs]
+            else:
+                console.print(f"[red]路径或标题不存在: {t}[/red]")
+                raise typer.Exit(code=1)
 
     console.print(f"平铺预览: {label} → {width}m×{height}m 画布（花型 40×60cm/格）")
     named = []

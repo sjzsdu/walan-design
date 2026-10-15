@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -232,10 +233,11 @@ def analyze_with_llm(trend_data: list, config: dict) -> list:
     env_var_map = {
         "openai": "OPENAI_API_KEY",
         "openrouter": "OPENROUTER_API_KEY",
+        "dashscope": "DASHSCOPE_API_KEY",
     }
     env_var = env_var_map.get(provider, "OPENAI_API_KEY")
     api_key = llm_cfg.get("api_key") or os.environ.get(env_var, "")
-    base_url = llm_cfg.get("base_url")  # OpenRouter 需要
+    base_url = llm_cfg.get("base_url")  # OpenRouter / DashScope 需要
 
     if not api_key:
         logger.warning(f"未配置 {env_var}，使用本地规则生成 Brief")
@@ -252,113 +254,174 @@ def analyze_with_llm(trend_data: list, config: dict) -> list:
     # 视觉分析：趋势数据里带真实下载图片时，直接给视觉模型看图
     vision_cfg = config["trend"].get("vision", {})
     image_items = [t for t in trend_data if t.get("image_path")][: int(vision_cfg.get("max_images", 8))]
-    model = llm_cfg.get("model", "gpt-4o")
+    text_model = llm_cfg.get("model", "gpt-4o")
+    vision_model = vision_cfg.get("model", text_model)
     user_content = f"趋势数据：\n{trend_summary}"
-    if image_items:
-        model = vision_cfg.get("model", model)
-        logger.info(f"  视觉模式：附加 {len(image_items)} 张真实趋势图（{model}）")
+    use_vision = bool(image_items)
+    if use_vision:
+        logger.info(f"  视觉模式：附加 {len(image_items)} 张真实趋势图（{vision_model}）")
 
-    try:
-        import base64
+    import time as _time
 
-        from openai import OpenAI
+    MAX_RETRIES = 2  # 共 3 次尝试（首次 + 2 次重试）
+    _last_err = None
 
-        client_kwargs = {"api_key": api_key}
-        if base_url:
-            client_kwargs["base_url"] = base_url
-        client = OpenAI(**client_kwargs)
-
-        if image_items:
-            content_parts = [
-                {
-                    "type": "text",
-                    "text": "以下是当前 Pinterest 上真实流行的花型图片（附描述数据）。"
-                    "请逐张分析它们的母题、配色、风格趋势，再结合趋势数据生成 Brief：\n\n" + trend_summary,
-                }
-            ]
-            for t in image_items:
-                with open(t["image_path"], "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode()
-                content_parts.append(
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                )
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content_parts},
-            ]
-            # 部分免费视觉模型不支持 response_format，靠解析兜底
-            response = client.chat.completions.create(model=model, messages=messages, temperature=0.8)
-        else:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.8,
-            )
-        content = response.choices[0].message.content
-
-        # 容错解析：模型可能返回 ```json 包裹或前后带说明文字
-        result = None
+    for attempt in range(MAX_RETRIES + 1):
         try:
-            result = json.loads(content)
-        except json.JSONDecodeError:
-            m = re.search(r"\[.*\]|\{.*\}", content, re.DOTALL)
-            if m:
-                result = json.loads(m.group(0))
-        if result is None:
-            raise ValueError(f"LLM 返回内容无法解析为 JSON: {content[:200]}")
+            import base64
 
-        # LLM 可能返回 {"briefs": [...]} / {"designs": [...]} / 裸数组 / 单个对象
-        if isinstance(result, dict):
-            briefs = result.get("briefs") or result.get("designs") or [result]
-        elif isinstance(result, list):
-            briefs = result
-        else:
-            briefs = [result]
+            from openai import OpenAI
 
-        # 规范化每个 brief：tags 可能是字符串（"植物、抽象"）或数组
-        valid_tags = set(config["walan"]["existing_tags"])
-        normalized = []
-        for b in briefs:
-            if not isinstance(b, dict):
-                continue
-            tags = b.get("tags", [])
-            if isinstance(tags, str):
-                # 按 、/,/空格 拆分
-                for sep in ["，", ",", " ", "、"]:
-                    tags = tags.replace(sep, "、")
-                tags = [t.strip() for t in tags.split("、") if t.strip()]
-            elif isinstance(tags, list):
-                tags = [str(t).strip() for t in tags if str(t).strip()]
+            client_kwargs = {"api_key": api_key}
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            client = OpenAI(**client_kwargs)
+
+            # 视觉模型可能配独立 base_url/key（如 DashScope 仅开 OCR 权限时，
+            # 视觉走 OpenRouter 免费模型），与文本 LLM 分路
+            vision_client = client
+            v_base = vision_cfg.get("base_url")
+            if use_vision and v_base and v_base != base_url:
+                # siliconflow 时优先读 SILICONFLOW_API_KEY
+                if "siliconflow" in v_base.lower():
+                    v_key = vision_cfg.get("api_key") or os.environ.get("SILICONFLOW_API_KEY", "") or api_key
+                else:
+                    v_key = vision_cfg.get("api_key") or os.environ.get("OPENROUTER_API_KEY", "") or api_key
+                vision_client = OpenAI(api_key=v_key, base_url=v_base)
+
+            if use_vision:
+                content_parts = [
+                    {
+                        "type": "text",
+                        "text": "以下是当前 Pinterest 上真实流行的花型图片（附描述数据）。"
+                        "请逐张分析它们的母题、配色、风格趋势，再结合趋势数据生成 Brief：\n\n" + trend_summary,
+                    }
+                ]
+                for t in image_items:
+                    with open(t["image_path"], "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                    content_parts.append(
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                    )
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": content_parts},
+                ]
+                # 部分免费视觉模型不支持 response_format，靠解析兜底
+                response = vision_client.chat.completions.create(model=vision_model, messages=messages, temperature=0.8)
             else:
-                tags = []
-            # 过滤到瓦栏有效标签集合内；不足时从有效集合补齐
-            tags = [t for t in tags if t in valid_tags]
-            if len(tags) < 3:
-                for t in ["花卉", "植物", "几何", "抽象", "田园"]:
-                    if len(tags) >= 3:
-                        break
-                    if t not in tags:
-                        tags.append(t)
-            b["tags"] = tags[:5]
-            normalized.append(b)
+                response = client.chat.completions.create(
+                    model=text_model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.8,
+                )
+            # None guard：免费模型偶发返回 choices=None / content=None
+            if not response.choices:
+                finish_reason = getattr(response.choices[0], "finish_reason", "unknown") if response.choices else "no_choices"
+                raise ValueError(f"LLM 返回无 choices（finish_reason={finish_reason}，可能上游 502）")
+            content = response.choices[0].message.content
 
-        if not normalized:
-            raise ValueError("LLM 未返回有效 brief")
-        return normalized[:brief_count]
-    except Exception as e:
-        logger.error(f"LLM 分析失败: {e}")
-        from walan_design.diagnostics import record_attention
+            if content is None:
+                finish_reason = response.choices[0].finish_reason if response.choices else "unknown"
+                raise ValueError(
+                    f"LLM 返回 content=None（finish_reason={finish_reason}），"
+                    f"可能被安全过滤或模型路由异常"
+                )
 
-        record_attention(
-            config,
-            "趋势分析",
-            f"LLM 分析失败，Brief 降级为本地模板: {e}",
-        )
-        return _local_fallback_briefs(brief_count, style_prefs)
+            # 容错解析：模型可能返回 ```json 包裹或前后带说明文字
+            result = None
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                m = re.search(r"\[.*\]|\{.*\}", content, re.DOTALL)
+                if m:
+                    result = json.loads(m.group(0))
+            if result is None:
+                raise ValueError(f"LLM 返回内容无法解析为 JSON: {content[:200]}")
+
+            # LLM 可能返回 {"briefs": [...]} / {"designs": [...]} / 裸数组 / 单个对象
+            if isinstance(result, dict):
+                briefs = result.get("briefs") or result.get("designs") or [result]
+            elif isinstance(result, list):
+                briefs = result
+            else:
+                briefs = [result]
+
+            # 规范化每个 brief：tags 可能是字符串（"植物、抽象"）或数组
+            valid_tags = set(config["walan"]["existing_tags"])
+            normalized = []
+            for b in briefs:
+                # None / 非 dict 跳过（LLM 偶发返回 null / 字符串混入数组）
+                if not isinstance(b, dict):
+                    continue
+                tags = b.get("tags", [])
+                if isinstance(tags, str):
+                    # 按 、/,/空格 拆分
+                    for sep in ["，", ",", " ", "、"]:
+                        tags = tags.replace(sep, "、")
+                    tags = [t.strip() for t in tags.split("、") if t.strip()]
+                elif isinstance(tags, list):
+                    tags = [str(t).strip() for t in tags if str(t).strip()]
+                else:
+                    tags = []
+                # 过滤到瓦栏有效标签集合内；不足时从有效集合补齐
+                tags = [t for t in tags if t in valid_tags]
+                if len(tags) < 3:
+                    for t in ["花卉", "植物", "几何", "抽象", "田园"]:
+                        if len(tags) >= 3:
+                            break
+                        if t not in tags:
+                            tags.append(t)
+                b["tags"] = tags[:5]
+                # floral_type 兜底：LLM 漏输出时按 config brief_type 补齐
+                # （2026-10-12：热带花卉 floral_type=None，数码判定靠兜底绕过了 brief 层）
+                ft = (b.get("floral_type") or "").strip().lower()
+                if ft not in ("traditional", "digital"):
+                    b["floral_type"] = "digital" if config["design"].get("brief_type") == "digital" else "traditional"
+                normalized.append(b)
+
+            if not normalized:
+                raise ValueError("LLM 未返回有效 brief")
+
+            if attempt > 0:
+                logger.info(f"  LLM 重试成功（第 {attempt + 1} 次尝试）")
+            return normalized[:brief_count]
+
+        except Exception as e:
+            _last_err = e
+            err_str = str(e)
+            logger.warning(f"  LLM 调用异常 (attempt {attempt}): {e}\n{traceback.format_exc()[-400:]}")
+            # 视觉模型不可用（model_not_found / access_denied）→ 降级为纯文本分析
+            if use_vision and ("model_not_found" in err_str or "not exist" in err_str or "access_denied" in err_str):
+                logger.warning(f"  视觉模型 {vision_model} 不可用，降级为纯文本分析（{text_model}）")
+                use_vision = False
+                continue  # 重试循环，但这次走 text-only 路径
+            is_retryable = isinstance(e, (ValueError, json.JSONDecodeError)) or "content=None" in err_str
+            if is_retryable and attempt < MAX_RETRIES:
+                wait = (attempt + 1) * 2
+                logger.warning(
+                    f"  LLM 调用失败（第 {attempt + 1}/{MAX_RETRIES + 1} 次），{wait}s 后重试: {e}"
+                )
+                _time.sleep(wait)
+                continue
+            # 不可重试或已耗尽重试次数 → 跳出循环 fallback
+            logger.error(f"  LLM 调用不可重试或已耗尽次数: {e}")
+            break
+
+    # 全部重试失败 → fallback
+    logger.error(f"LLM 分析失败（共 {MAX_RETRIES + 1} 次尝试）: {_last_err}")
+    from walan_design.diagnostics import record_attention
+
+    record_attention(
+        config,
+        "趋势分析",
+        f"LLM 分析失败，Brief 降级为本地模板: {_last_err}",
+    )
+    return _local_fallback_briefs(brief_count, style_prefs)
 
 
 def run(config: dict = None) -> list:

@@ -9,6 +9,7 @@
 """
 
 import io
+import json
 import logging
 import re
 import shutil
@@ -92,11 +93,14 @@ def open_previews(named_images: list):
     return paths
 
 
-def resolve_local_design(design_id: str, runs_dir: str) -> dict:
+def resolve_local_design(design_id: str, runs_dir: str, walan_title: str = "") -> dict:
     """按瓦栏设计号找本地花型目录（upload_result.json 里记录了设计号）
 
     返回 {dir, pngs, variant}，找不到返回 None。
     设计号对应唯一上传的变体（如 赤陶热带叶_1 → design_1.png）。
+
+    walan_title: 瓦栏上该设计的标题（如 "热带花卉_1"），用于设计号未写入本地时
+    用 brief.json 兜底匹配。
     """
     runs = Path(runs_dir)
     if not runs.exists():
@@ -104,14 +108,37 @@ def resolve_local_design(design_id: str, runs_dir: str) -> dict:
     # 不能用 \b 边界：中文"进"也算 word 字符，"1680457进入..."匹配不上；
     # 用数字前后断言：前面和后面都不是数字即可
     pat = re.compile(rf"(?<!\d){re.escape(design_id)}(?!\d)")
+
+    title_match = ""
+    if walan_title:
+        # "热带花卉_1" → 去后缀 "热带花卉"
+        title_match = re.sub(r"_\d+$", "", walan_title).strip()
+
     for d in sorted(runs.iterdir()):
         ur = d / "upload_result.json"
-        if not (d.is_dir() and ur.exists()):
+        if not (d.is_dir() and (ur.exists() or (d / "brief.json").exists())):
             continue
-        try:
-            if not pat.search(ur.read_text(encoding="utf-8")):
-                continue
-        except Exception:
+        # 优先：upload_result.json 里搜设计号
+        found = False
+        if ur.exists():
+            try:
+                if pat.search(ur.read_text(encoding="utf-8")):
+                    found = True
+            except Exception:
+                pass
+        # 兜底：按标题匹配（walan 上传时命名规则是 "{标题}_N"）
+        if not found and title_match:
+            brief = d / "brief.json"
+            if brief.exists():
+                try:
+                    brief_data = json.loads(brief.read_text(encoding="utf-8"))
+                    if brief_data.get("title") == title_match:
+                        found = True
+                        logger.debug(f"  resolve_local_design: 设计号 {design_id} 未找到，"
+                                     f"按标题 {title_match} 匹配到 {d.name}")
+                except Exception:
+                    pass
+        if not found:
             continue
 
         # 从 upload.json 的 psd_path 解析变体号（{标题}_N.psd → design_N.png）
